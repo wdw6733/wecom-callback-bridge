@@ -1,0 +1,25 @@
+services:
+  wecom-callback:
+    build: .
+    container_name: wecom-callback
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # 宿主机端口 : 容器端口。改宿主机端口只改冒号前面那个数字，
+      # 回调 URL 里的端口要跟着改。
+      - "18789:18789"
+    volumes:
+      # Docker Engine API：管理 NAS 上的容器
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 只读挂载：读 NAS 主机的负载、内存、磁盘
+      - /proc:/host/proc:ro
+      - /:/host:ro
+      # 只读挂载：读温度传感器（VM 内通常读不到，没有它也不影响）
+      - /sys:/host/sys:ro
+      # 只读挂载：读数据盘用量（必须是宿主机上真实存在的路径）
+      - /mnt/PT:/host/mnt/PT:ro
+      - /mnt/Strongge:/host/mnt/Strongge:ro
+      # 持久化数据（去重缓存等以后可能用到）
+      - ./data:/data
+      # 机器人代码文件挂载（可写，方便直接改代码重启）
+      - ./wecom_callback.py:/app/wecom_callback.py
