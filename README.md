@@ -33,22 +33,25 @@ IP，手动加进可信 IP 列表就行，回调地址用你现有的 Lucky 反�
 
 ## 从 v2.0 升级（已部署 v2.0 的用户看这里）
 
-v2.0 已经在跑的，直接覆盖文件升级，不用重新建应用、不用改回调地址、不用改可信 IP：
+v2.0 已经在跑的，直接拉镜像升级，不用重新建应用、不用改回调地址、不用改可信 IP。
+NAS 上只需要留 `docker-compose.yml` + `.env`（+ `data/`），源码文件（wecom_callback.py 等）可以删掉，
+以后每次升级都只是拉新镜像。
 
 ```bash
-# 1. 把这 6 个文件拷到 NAS，覆盖原来的（目标目录不变）
-#    wecom_callback.py  Dockerfile  docker-compose.yml  requirements.txt  .env.example  README.md
+# 1. 先把目录里的 docker-compose.yml 换成仓库里最新的那份
+#    （v2.1 起 compose 用的是 ghcr.io 预构建镜像，不再 build）
 #    目标目录：/mnt/Strongge/docker-compose/wecom-callback-bridge/
-#    注意：不要覆盖 .env（里面有真实凭证）；.env.example 只是模板。
+#    注意：不要覆盖 .env（里面有真实凭证）。
 
 cd /mnt/Strongge/docker-compose/wecom-callback-bridge
 
-# 2. （可选）补新配置：ESXi、自我更新、告警阈值，见 .env.example 末尾的 v2.1 新增段
+# 2. （可选）补新配置：ESXi、自我更新、告警阈值，见仓库里 .env.example 末尾的 v2.1 新增段
 #    不填也能跑，只是 ESXi VM、重启 NAS、自我更新会回一句“未配置”。
 nano .env
 
-# 3. 重新构建并启动（--build 是必须的，requirements.txt 多了 paramiko）
-docker compose up -d --build
+# 3. 拉新镜像并启动（不用 --build；镜像由 GitHub Actions 在每次 push 后自动构建并推到 ghcr.io）
+docker compose pull
+docker compose up -d
 
 # 4. 看日志，确认起来了
 docker compose logs -f wecom-callback
@@ -156,8 +159,8 @@ echostr，桥没跑起来就验证失败、保存不上。所以回调配置必�
 ### 第 2 步：拷文件、填 `.env`
 
 ```bash
-# 1. 把这 6 个文件拷到 NAS（和 bot3、v1 桥同一级目录）
-#    wecom_callback.py  Dockerfile  docker-compose.yml  requirements.txt  .env.example  README.md
+# 1. 把 docker-compose.yml 和 .env.example 拷到 NAS（和 bot3、v1 桥同一级目录）
+#    源码不用拷：镜像由 GitHub Actions 自动构建并推到 ghcr.io，升级时直接拉镜像。
 #    目标目录：/mnt/Strongge/docker-compose/wecom-callback-bridge/
 
 cd /mnt/Strongge/docker-compose/wecom-callback-bridge
@@ -182,7 +185,8 @@ nano .env
 ### 第 3 步：启动桥
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 
 # 看日志，确认服务起来了
 docker compose logs -f wecom-callback
