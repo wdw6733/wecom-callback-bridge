@@ -38,10 +38,10 @@ v2.0 已经在跑的，直接覆盖文件升级，不用重新建应用、不用
 ```bash
 # 1. 把这 6 个文件拷到 NAS，覆盖原来的（目标目录不变）
 #    wecom_callback.py  Dockerfile  docker-compose.yml  requirements.txt  .env.example  README.md
-#    目标目录：/mnt/Strongge/docker-compose/wecom-callback/
+#    目标目录：/mnt/Strongge/docker-compose/wecom-callback-bridge/
 #    注意：不要覆盖 .env（里面有真实凭证）；.env.example 只是模板。
 
-cd /mnt/Strongge/docker-compose/wecom-callback
+cd /mnt/Strongge/docker-compose/wecom-callback-bridge
 
 # 2. （可选）补新配置：ESXi、自我更新、告警阈值，见 .env.example 末尾的 v2.1 新增段
 #    不填也能跑，只是 ESXi VM、重启 NAS、自我更新会回一句“未配置”。
@@ -158,9 +158,9 @@ echostr，桥没跑起来就验证失败、保存不上。所以回调配置必�
 ```bash
 # 1. 把这 6 个文件拷到 NAS（和 bot3、v1 桥同一级目录）
 #    wecom_callback.py  Dockerfile  docker-compose.yml  requirements.txt  .env.example  README.md
-#    目标目录：/mnt/Strongge/docker-compose/wecom-callback/
+#    目标目录：/mnt/Strongge/docker-compose/wecom-callback-bridge/
 
-cd /mnt/Strongge/docker-compose/wecom-callback
+cd /mnt/Strongge/docker-compose/wecom-callback-bridge
 
 # 2. 建 .env，在 NAS 上直接填（Secret 绝不要经过聊天发过来）
 cp .env.example .env
@@ -242,7 +242,7 @@ docker compose logs -f wecom-callback
 #### 方法 A：命令行（推荐，跟着桥一起跑）
 
 ```bash
-cd /mnt/Strongge/docker-compose/wecom-callback
+cd /mnt/Strongge/docker-compose/wecom-callback-bridge
 docker compose exec wecom-callback python wecom_callback.py create-menu
 # 返回 {"errcode":0,"errmsg":"ok"} 就是建好了
 ```
