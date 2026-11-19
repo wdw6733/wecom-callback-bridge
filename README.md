@@ -49,9 +49,9 @@ cd /mnt/Strongge/docker-compose/wecom-callback-bridge
 #    不填也能跑，只是 ESXi VM、重启 NAS、自我更新会回一句“未配置”。
 nano .env
 
-# 3. 拉新镜像并启动（不用 --build；镜像由 GitHub Actions 在每次 push 后自动构建并推到 ghcr.io）
-docker compose pull
-docker compose up -d
+# 3. 重启即升级（不用 --build、不用单独 pull；compose 里 pull_policy: always，
+#    每次 up -d 都会先拉最新镜像。镜像由 GitHub Actions 在每次 push 后自动构建并推到 ghcr.io）
+docker compose down && docker compose up -d
 
 # 4. 看日志，确认起来了
 docker compose logs -f wecom-callback
@@ -185,8 +185,8 @@ nano .env
 ### 第 3 步：启动桥
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose down && docker compose up -d
+# 重启即升级：compose 里 pull_policy: always，每次 up -d 都会先拉最新镜像，不用单独 pull
 
 # 看日志，确认服务起来了
 docker compose logs -f wecom-callback
