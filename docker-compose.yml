@@ -3,6 +3,10 @@ services:
     # 直接拉预构建镜像升级，不用在 NAS 上放源码、不用 build。
     # 镜像由 GitHub Actions 在每次 push 到 main 后自动构建并推到 ghcr.io。
     image: ghcr.io/wdw6733/wecom-callback-bridge:latest
+    # 重启自动更新：每次 up -d 都先拉最新镜像，
+    # 所以 `docker compose down && docker compose up -d` 就等于升级，不用再单独 pull。
+    # （离线时 up 会失败，临时绕过：docker compose up -d --pull never）
+    pull_policy: always
     container_name: wecom-callback
     restart: unless-stopped
     env_file: .env
