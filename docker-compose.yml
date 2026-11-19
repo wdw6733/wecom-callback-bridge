@@ -1,6 +1,8 @@
 services:
   wecom-callback:
-    build: .
+    # 直接拉预构建镜像升级，不用在 NAS 上放源码、不用 build。
+    # 镜像由 GitHub Actions 在每次 push 到 main 后自动构建并推到 ghcr.io。
+    image: ghcr.io/wdw6733/wecom-callback-bridge:latest
     container_name: wecom-callback
     restart: unless-stopped
     env_file: .env
@@ -21,8 +23,6 @@ services:
       - /mnt/Strongge:/host/mnt/Strongge:ro
       # 持久化数据（去重缓存等以后可能用到）
       - ./data:/data
-      # 机器人代码文件挂载（可写，方便直接改代码重启）
-      - ./wecom_callback.py:/app/wecom_callback.py
       # ESXi SSH 私钥（可选）：想用 key 连 ESXi 而不是密码时，
       # 把私钥放进 ./data/id_ed25519，取消下面这行的注释，
       # 并在 .env 里填 ESXI_KEY_FILE=/data/id_ed25519。
