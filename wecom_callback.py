@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""企微自建应用回调桥 v2.0。
+"""企微自建应用回调桥 v2.1：TG 3 号机器人同款功能菜单。
 
 部署在 NAS 的 Docker 容器里，作为企微自建应用的回调服务器。
 和 v1.0（智能机器人长连接）不同，v2 走的是自建应用 + 回调 URL：
@@ -22,6 +22,9 @@
 - OWNER_USERIDS 为空时拒绝所有消息（fail safe），绝不放行陌生人。
 - v2 不执行任何破坏性操作（停/启/重启容器、重启 NAS），只读 + 聊天。
   破坏性请求一律回绝，并指到 Telegram 3 号机器人去确认执行。
+  v2.1 起：破坏性操作（启动/停止/重启/更新容器、清理镜像、VM 电源、
+  重启 NAS、自我更新安装）改走两步确认卡片（✅ 确认 / ❌ 取消），
+  确认令牌 5 分钟过期，绝不在一次点击、一条文字命令里直接执行。
 - LLM 调用失败只回一句人话，绝不把 traceback 发给用户。
 
 渲染规则（硬性，用户亲测）：
@@ -52,29 +55,40 @@ https://developer.work.weixin.qq.com/document/path/90930
 - 模板卡片（message/send 的 template_card msgtype）：
   button_interaction 卡片 = main_title + horizontal_content_list（最多 6 行，
   keyname 建议不超过 5 个字，value 建议不超过 30 个字）
-  + button_list（每个按钮 {text, style, key}）+ task_id（每发一次唯一）。
+  + button_list（最多 6 个按钮，每个按钮 {text, style, key}）+ task_id（每发一次唯一）。
   点按钮后回调推 template_card_event 事件，EventKey 就是按钮的 key，
   TaskId 是发卡片时填的 task_id。v2 收到点击后发一条新消息作答，
   不调 update_template_card 原地改卡。
 - 自定义菜单：POST /cgi-bin/menu/create?access_token=..&agentid=..，
-  一级最多 3 个按钮，子菜单最多 5 个、只允许一级子菜单。
+  一级最多 3 个按钮（名字 ≤16 字节），子菜单最多 5 个、只允许一级子菜单，
+  菜单 key ≤128 字节。
+- v2.1 与 TG 3 号的取舍（详见 README）：卡片每张最多 6 个按钮，
+  所以容器管理页用编号列表 + 回复序号选容器（TG 是每容器一个按钮），
+  容器详情卡 6 个操作按钮、返回靠底部菜单；“给 Muse 下指令”跳转按钮
+  在企微没有等价物，已省略；/docker 的启停命令在 TG 是直接执行，
+  在企微一律先出确认卡。
 """
 
 import base64
+import concurrent.futures
 import glob
 import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import requests
 from flask import Flask, request
@@ -84,7 +98,7 @@ try:
 except ImportError:  # pragma: no cover - 部署时 requirements.txt 会装好
     AES = None
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ---------------- 配置（只从环境变量读） ----------------
 
@@ -101,6 +115,45 @@ BOT_NAME = os.environ.get("BOT_NAME", "Marlowe").strip() or "Marlowe"
 CALLBACK_PORT = int(os.environ.get("WECOM_CALLBACK_PORT", "18789"))
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+# ESXi（可选）：填了才能用 ESXi VM、重启 NAS；不填时相关功能回一句“未配置”。
+ESXI_HOST = os.environ.get("ESXI_HOST", "").strip()
+ESXI_USER = os.environ.get("ESXI_USER", "root").strip() or "root"
+ESXI_PASSWORD = os.environ.get("ESXI_PASSWORD", "")
+ESXI_KEY_FILE = os.environ.get("ESXI_KEY_FILE", "").strip()
+NAS_VM_NAME = os.environ.get("NAS_VM_NAME", "").strip()
+NAS_VM_ID = os.environ.get("NAS_VM_ID", "").strip()
+# 自我更新（可选）：UPDATE_REPO 例如 wdw6733/wecom-callback-bridge，
+# 仓库根目录放 wecom_callback.py；私有仓库再填 UPDATE_TOKEN（只读）。
+UPDATE_REPO = os.environ.get("UPDATE_REPO", "").strip()
+UPDATE_BRANCH = os.environ.get("UPDATE_BRANCH", "main").strip() or "main"
+UPDATE_TOKEN = os.environ.get("UPDATE_TOKEN", "").strip()
+SELF_CONTAINER_NAME = os.environ.get("SELF_CONTAINER_NAME", "wecom-callback").strip() or "wecom-callback"
+# 主动告警（可选，默认开；阈值与 bot3 3 号机器人一致）
+ALERT_ENABLED_DEFAULT = os.environ.get("ALERT_ENABLED", "1").strip() not in ("0", "false", "no")
+ALERT_INTERVAL_SEC = _env_int("ALERT_INTERVAL_SEC", 300)
+ALERT_DISK_PCT = _env_float("ALERT_DISK_PCT", 90)
+ALERT_LOAD_MULT = _env_float("ALERT_LOAD_MULT", 2.0)
+ALERT_MEM_PCT = _env_float("ALERT_MEM_PCT", 92)
+ALERT_COOLDOWN_SEC = _env_int("ALERT_COOLDOWN_SEC", 3600)
+# 容器镜像更新检查（可选，默认开；与 bot3 一致，每 6 小时自动检查一次）
+IMAGE_CHECK_ENABLED = os.environ.get("IMAGE_CHECK_ENABLED", "1").strip() not in ("0", "false", "no")
+IMAGE_CHECK_INTERVAL_SEC = _env_int("IMAGE_CHECK_INTERVAL_SEC", 21600)
 _HOST_DATA_PATHS_RAW = os.environ.get("HOST_DATA_PATHS", "").strip()
 # 留空默认看 /mnt/PT 和 /mnt/Strongge（NAS 的两个数据目录）；.env 里填了就按填的来。
 HOST_DATA_PATHS = [p.strip() for p in _HOST_DATA_PATHS_RAW.split(",") if p.strip()] or ["/mnt/PT", "/mnt/Strongge"]
@@ -120,7 +173,8 @@ WELCOME_TEXT = (
     f"你好，我是{BOT_NAME}，企微通道已接通 ✅\n"
     "底部菜单可以直接点，也可以直接发指令。\n"
     "可以问我：系统状态、磁盘空间、容器列表、容器日志 <名字>，"
-    "也可以直接聊天提问。"
+    "也可以直接聊天提问。\n"
+    "危险操作（启停/更新容器、重启 NAS 等）要点两次确认才会执行。"
 )
 REFUSAL_TEXT = "抱歉，我只认主人。请联系管理员把你的企微 userid 加进白名单。"
 OWNER_EMPTY_HINT = "OWNER_USERIDS 为空，已拒绝全部消息。请在 .env 里填 OWNER_USERIDS。"
@@ -137,24 +191,55 @@ TEMP_UNAVAILABLE_TEXT = (
     "VM 内读不到温度传感器。NAS 是 ESXi 上的虚拟机，传感器一般不直通进 VM；"
     "温度请看 ESXi 主机或 TrueNAS 界面。"
 )
+ESXI_NOT_CONFIGURED_TEXT = (
+    "ESXi 未配置：在 .env 里填 ESXI_HOST / ESXI_USER / ESXI_PASSWORD 后重启容器。"
+)
+NAS_REBOOT_NOT_CONFIGURED_TEXT = (
+    "重启 NAS 还差一步：在 .env 里填 NAS_VM_NAME（NAS 这个 VM 在 ESXi 里的名字，"
+    "或用 NAS_VM_ID 填 ID），然后 docker compose up -d --build 重启容器。"
+    "填好后这个功能才能用。"
+)
+SELFUPDATE_NOT_CONFIGURED_TEXT = (
+    "自我更新未配置。\n\n"
+    "要在 .env 里填 UPDATE_REPO（例如 wdw6733/wecom-callback-bridge，"
+    "仓库根目录放 wecom_callback.py），私有仓库再填 UPDATE_TOKEN（只读）。"
+    "填好后重启容器，这个功能才能检查更新。"
+)
 
 HELP_TEXT = (
     f"你好，我是{BOT_NAME}。\n"
     "本地查询（直接发，或点底部菜单）：\n"
-    "· 系统状态\n"
-    "· 磁盘空间\n"
-    "· 容器列表\n"
-    "· 容器日志 <容器名>\n"
-    "其他问题直接发给我聊天。\n"
-    "重启/停止容器、重启 NAS 这类操作请去 Telegram 3 号机器人确认执行。"
+    "· 系统状态 / 公网 IP / 磁盘空间 / 温度 / 进程 TOP / 网络流量\n"
+    "· 容器列表 / 容器管理 / 容器资源 / 检查容器更新 / 清理镜像\n"
+    "· ESXi VM / 告警 / 检查更新（自我更新）\n"
+    "· 容器日志 <容器名> [行数] [关键词]\n"
+    "命令也一样能用：/status /docker /esxi /disk /check_updates /alerts /menu /help\n"
+    "危险操作（启停/更新容器、清理镜像、VM 电源、重启 NAS、自我更新安装）\n"
+    "都会先出一张确认卡，点 ✅ 确认才会执行，5 分钟内有效。"
 )
 
 # 菜单点击 → 等价的文字指令（走同一套 handle_text 路由）
+# 底部菜单 3 个一级 × 每个 5 个子项，与 TG 3 号主菜单一一对应：
+# 总览 = 系统状态/公网 IP/磁盘空间/温度/帮助；
+# 容器 = 容器列表/容器管理/容器资源/检查容器更新/清理镜像；
+# 更多 = ESXi VM/网络流量/进程 TOP/告警/检查更新（自我更新）。
+# 一级名字 ≤4 个汉字、子项 ≤7 个汉字、key ≤128 字节（官方限制，见 README）。
 MENU_KEY_TO_TEXT = {
     "MENU_STATUS": "系统状态",
-    "MENU_CONTAINERS": "容器列表",
+    "MENU_IP": "公网 IP",
     "MENU_DISK": "磁盘空间",
+    "MENU_TEMP": "温度",
     "MENU_HELP": "帮助",
+    "MENU_CONTAINERS": "容器列表",
+    "MENU_MANAGE": "容器管理",
+    "MENU_STATS": "容器资源",
+    "MENU_CHECK_UPDATES": "检查容器更新",
+    "MENU_PRUNE": "清理镜像",
+    "MENU_ESXI": "ESXi VM",
+    "MENU_NET": "网络流量",
+    "MENU_TOP": "进程 TOP",
+    "MENU_ALERTS": "告警",
+    "MENU_SELFUPDATE": "检查更新",
 }
 
 # 破坏性操作关键词：v2 一律不执行，只回绝 + 记日志
@@ -317,19 +402,85 @@ def parse_inner_message(inner_xml):
     return base
 
 
-def build_menu_payload():
-    """自建应用自定义菜单（menu/create 的 body）。
+def validate_menu_payload(payload):
+    """按官方限制校验菜单：返回错误提示，否则返回 None。
 
-    一级最多 3 个：系统状态 / 容器列表 / 更多（子菜单：磁盘空间、帮助）。
-    子菜单只允许一级、最多 5 个。key 与 MENU_KEY_TO_TEXT 对应。
+    一级 1-3 个、名字 ≤16 字节；子菜单 1-5 个、只允许一级；
+    key ≤128 字节。名字再按更严的习惯收紧（一级 ≤4 汉字、子项 ≤7 汉字），
+    超了企微客户端会截断成“…”。
+    """
+    buttons = payload.get("button") or []
+    if not (1 <= len(buttons) <= 3):
+        return f"一级菜单个数不对：{len(buttons)}（应为 1-3 个）"
+    seen_keys = set()
+    for b in buttons:
+        name = b.get("name", "")
+        if len(name.encode("utf-8")) > 16:
+            return f"一级菜单名字太长：{name}"
+        if len(name) > 4:
+            return f"一级菜单名字超过 4 个汉字：{name}"
+        sub = b.get("sub_button") or []
+        if sub:
+            if not (1 <= len(sub) <= 5):
+                return f"子菜单个数不对：{len(sub)}（应为 1-5 个）"
+            if "key" in b or "type" in b:
+                return f"带子菜单的一级按钮不能同时有 key/type：{name}"
+            for s in sub:
+                if s.get("sub_button"):
+                    return f"子菜单不能再嵌套：{s.get('name')}"
+                sname = s.get("name", "")
+                if len(sname.encode("utf-8")) > 40:
+                    return f"子菜单名字太长：{sname}"
+                if len(sname) > 7:
+                    return f"子菜单名字超过 7 个汉字：{sname}"
+                key = s.get("key", "")
+                if not key or len(key.encode("utf-8")) > 128:
+                    return f"子菜单 key 非法：{sname}"
+                if key in seen_keys:
+                    return f"菜单 key 重复：{key}"
+                seen_keys.add(key)
+        else:
+            key = b.get("key", "")
+            if not key or len(key.encode("utf-8")) > 128:
+                return f"一级菜单 key 非法：{name}"
+            if key in seen_keys:
+                return f"菜单 key 重复：{key}"
+            seen_keys.add(key)
+    return None
+
+
+def build_menu_payload():
+    """自建应用自定义菜单（menu/create 的 body），3 个一级 × 每个 5 个子项。
+
+    总览 = 系统状态/公网 IP/磁盘空间/温度/帮助；
+    容器 = 容器列表/容器管理/容器资源/检查容器更新/清理镜像；
+    更多 = ESXi VM/网络流量/进程 TOP/告警/检查更新（自我更新）。
+    key 与 MENU_KEY_TO_TEXT 对应。重启 NAS 不进菜单（TG 里也要点两次确认，
+    企微这里只接受文字“重启 NAS”再出确认卡，绝不一键触发）。
+    “给 Muse 下指令”跳转按钮在企微没有等价物，已省略（见 README）。
     """
     return {
         "button": [
-            {"type": "click", "name": "系统状态", "key": "MENU_STATUS"},
-            {"type": "click", "name": "容器列表", "key": "MENU_CONTAINERS"},
-            {"name": "更多", "sub_button": [
+            {"name": "总览", "sub_button": [
+                {"type": "click", "name": "系统状态", "key": "MENU_STATUS"},
+                {"type": "click", "name": "公网 IP", "key": "MENU_IP"},
                 {"type": "click", "name": "磁盘空间", "key": "MENU_DISK"},
+                {"type": "click", "name": "温度", "key": "MENU_TEMP"},
                 {"type": "click", "name": "帮助", "key": "MENU_HELP"},
+            ]},
+            {"name": "容器", "sub_button": [
+                {"type": "click", "name": "容器列表", "key": "MENU_CONTAINERS"},
+                {"type": "click", "name": "容器管理", "key": "MENU_MANAGE"},
+                {"type": "click", "name": "容器资源", "key": "MENU_STATS"},
+                {"type": "click", "name": "检查容器更新", "key": "MENU_CHECK_UPDATES"},
+                {"type": "click", "name": "清理镜像", "key": "MENU_PRUNE"},
+            ]},
+            {"name": "更多", "sub_button": [
+                {"type": "click", "name": "ESXi VM", "key": "MENU_ESXI"},
+                {"type": "click", "name": "网络流量", "key": "MENU_NET"},
+                {"type": "click", "name": "进程 TOP", "key": "MENU_TOP"},
+                {"type": "click", "name": "告警", "key": "MENU_ALERTS"},
+                {"type": "click", "name": "检查更新", "key": "MENU_SELFUPDATE"},
             ]},
         ]
     }
@@ -459,21 +610,80 @@ CARD_BUTTONS = [
     {"text": "主菜单", "style": 2, "key": "CARD_MENU"},
 ]
 
+# 状态卡片多一个“容器列表”入口（TG 主菜单同款，卡片按钮上限 6 个，5 个够放）。
+STATUS_BUTTONS = [
+    {"text": "温度详情", "style": 1, "key": "CARD_TEMP"},
+    {"text": "磁盘详情", "style": 1, "key": "CARD_DISK"},
+    {"text": "容器列表", "style": 1, "key": "CARD_CONTAINERS"},
+    {"text": "刷新", "style": 2, "key": "CARD_REFRESH"},
+    {"text": "主菜单", "style": 2, "key": "CARD_MENU"},
+]
+
+# 容器管理卡片的按钮（每页 6 个容器，按钮上限 6 个，放不下每容器一个按钮，
+# 所以容器用编号列表 + 回复序号选容器；取舍说明见 README）。
+# 注意：翻页按钮带页码后缀（MG_PREV_<页> / MG_NEXT_<页>），见 build_manage_card。
+
+# 容器详情卡片的按钮（TG 同款 6 个操作；卡片按钮上限 6 个，返回靠底部菜单）。
+DETAIL_BUTTONS_TEMPLATE = [
+    {"text": "▶️ 启动", "style": 1, "key": "C_ASK_START_{sid}"},
+    {"text": "⏹️ 停止", "style": 1, "key": "C_ASK_STOP_{sid}"},
+    {"text": "🔄 重启", "style": 1, "key": "C_ASK_RESTART_{sid}"},
+    {"text": "📋 看日志", "style": 1, "key": "C_LOGS_{sid}"},
+    {"text": "🔍 搜日志", "style": 1, "key": "C_SEARCH_{sid}"},
+    {"text": "⬆️ 更新容器", "style": 1, "key": "C_ASK_UPDATE_{sid}"},
+]
+
+# VM 详情卡片的按钮（TG 同款 3 个电源操作 + 2 个返回）。
+VM_BUTTONS_TEMPLATE = [
+    {"text": "▶️ 开机", "style": 1, "key": "E_ASK_ON_{vmid}"},
+    {"text": "⏻ 优雅关机", "style": 1, "key": "E_ASK_OFF_{vmid}"},
+    {"text": "⚡ 强制断电", "style": 1, "key": "E_ASK_KILL_{vmid}"},
+    {"text": "⬅️ VM 列表", "style": 2, "key": "E_LIST"},
+    {"text": "⬅️ 主菜单", "style": 2, "key": "CARD_MENU"},
+]
+
+# 告警卡片的按钮（开关随当前状态变，见 build_alerts_card）。
+ALERT_BUTTONS_ON = [
+    {"text": "🔕 关闭告警", "style": 1, "key": "ALERT_OFF"},
+    {"text": "⬅️ 主菜单", "style": 2, "key": "CARD_MENU"},
+]
+ALERT_BUTTONS_OFF = [
+    {"text": "🔔 开启告警", "style": 1, "key": "ALERT_ON"},
+    {"text": "⬅️ 主菜单", "style": 2, "key": "CARD_MENU"},
+]
+
+# 功能菜单卡片的按钮。
+HELP_BUTTONS = [
+    {"text": "系统状态", "style": 1, "key": "CARD_STATUS"},
+    {"text": "容器列表", "style": 1, "key": "CARD_CONTAINERS"},
+    {"text": "主菜单", "style": 2, "key": "CARD_MENU"},
+]
+
 
 def _new_task_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
-def _make_card(title, rows):
-    """button_interaction 卡片：主标题 + 横向 key-value 行（最多 6 行）+ 4 个按钮。"""
-    return {
+def _card_value(value, limit=30):
+    """卡片 value 建议不超过 30 个字，超了截断（官方建议值）。"""
+    value = str(value)
+    return value if len(value) <= limit else value[:limit - 1] + "…"
+
+
+def _make_card(title, rows, buttons=None, task_prefix="nas", sub_title=None):
+    """button_interaction 卡片：主标题 + 横向 key-value 行（最多 6 行）+ 按钮。
+
+    buttons 不传时用默认 4 个按钮；官方限制 button_list 最多 6 个。
+    """
+    card = {
         "card_type": "button_interaction",
         "source": {"desc": BOT_NAME, "desc_color": 0},
-        "main_title": {"title": title, "desc": cst_now()},
+        "main_title": {"title": title, "desc": sub_title or cst_now()},
         "horizontal_content_list": rows[:6],
-        "button_list": CARD_BUTTONS,
-        "task_id": _new_task_id("nas"),
+        "button_list": buttons if buttons is not None else CARD_BUTTONS,
+        "task_id": _new_task_id(task_prefix),
     }
+    return card
 
 
 def build_status_card():
@@ -499,7 +709,7 @@ def build_status_card():
         rows.append({"keyname": "容器", "value": f"运行 {running} / 共 {len(items)}"})
     except Exception as e:
         log("容器汇总失败：", type(e).__name__, str(e)[:200])
-    return _make_card("NAS 状态", rows)
+    return _make_card("NAS 状态", rows, buttons=STATUS_BUTTONS)
 
 
 def build_disk_card():
@@ -539,6 +749,207 @@ def fmt_containers_markdown():
     if len(items) > 30:
         lines.append(f"…还有 {len(items) - 30} 个未显示")
     return "\n".join(lines)
+
+
+# ---------------- 两步确认卡片 + 选择状态（v2.1 新增） ----------------
+# 破坏性操作绝不在一次点击里执行：先出一张确认卡，点 ✅ 才执行。
+# 确认令牌只活 5 分钟，存在内存里（容器重启就失效，要重新操作一次）。
+
+CONFIRM_TTL_SEC = 300
+_PENDING_CONFIRM = {}   # token -> {"kind","action","target","label","userid","expires"}
+_PENDING_CONFIRM_LOCK = threading.Lock()
+_PENDING_SEARCH = {}    # userid -> (shortid, expires)：搜日志等用户回关键词
+_MANAGE_STATE = {}      # userid -> {"page": int, "items": [shortid], "expires": float}
+_ESXI_STATE = {}        # userid -> {"items": [vmid], "expires": float}
+_SELECT_TTL_SEC = 600
+
+
+def new_confirm(kind, action, target, label, userid):
+    """建一个待确认操作，返回确认卡片里要用的 token。"""
+    token = uuid.uuid4().hex[:10]
+    with _PENDING_CONFIRM_LOCK:
+        _PENDING_CONFIRM[token] = {
+            "kind": kind, "action": action, "target": target,
+            "label": label, "userid": userid,
+            "expires": time.monotonic() + CONFIRM_TTL_SEC,
+        }
+    return token
+
+
+def take_confirm(token, userid):
+    """取走一次确认：不存在/过期/不是本人 → 返回 None（不执行）。"""
+    with _PENDING_CONFIRM_LOCK:
+        entry = _PENDING_CONFIRM.pop(token, None)
+    if entry is None:
+        return None
+    if entry.get("userid") != userid:
+        return None
+    if time.monotonic() > entry.get("expires", 0):
+        return None
+    return entry
+
+
+def build_confirm_card(label, detail, token):
+    """两步确认卡片：操作 + 说明 + [✅ 确认][❌ 取消]。"""
+    rows = [
+        {"keyname": "操作", "value": _card_value(label)},
+        {"keyname": "说明", "value": _card_value(detail)},
+    ]
+    buttons = [
+        {"text": "✅ 确认", "style": 1, "key": f"CF_OK_{token}"},
+        {"text": "❌ 取消", "style": 2, "key": f"CF_NO_{token}"},
+    ]
+    return _make_card("请确认", rows, buttons=buttons, task_prefix="cf",
+                      sub_title="5 分钟内有效，过期请重新操作")
+
+
+def ask_confirm(kind, action, target, label, detail, userid):
+    """建确认、返回确认卡片回复。调用方只负责展示，不执行。"""
+    token = new_confirm(kind, action, target, label, userid)
+    log("已出确认卡：", kind, action, target, "来自", userid)
+    return card_reply(build_confirm_card(label, detail, token))
+
+
+# ---------------- 容器管理 / 详情 / ESXi / 告警 / 功能菜单卡片 ----------------
+
+MANAGE_PAGE_SIZE = 6  # 卡片每页最多 6 行，正好一页 6 个容器
+
+
+def build_manage_card(page=0, userid=""):
+    """容器管理卡：每页 6 个容器编号列表 + [上一页][下一页][清理镜像][主菜单]。
+
+    取舍（卡片按钮上限 6 个，TG 那种每容器一个按钮放不下）：
+    卡片行里按序号列出本页容器，回复序号（或容器名）选容器进详情卡。
+    """
+    items = sorted(list_containers(), key=container_display_name)
+    total_pages = max(1, (len(items) + MANAGE_PAGE_SIZE - 1) // MANAGE_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    page_items = items[page * MANAGE_PAGE_SIZE:(page + 1) * MANAGE_PAGE_SIZE]
+    shortids = [c["Id"][:12] for c in page_items]
+    if userid:
+        _MANAGE_STATE[userid] = {
+            "page": page, "items": shortids,
+            "expires": time.monotonic() + _SELECT_TTL_SEC,
+        }
+    rows = []
+    for i, c in enumerate(page_items):
+        state = c.get("State", "?")
+        dot = "🟢" if state == "running" else "⚪"
+        rows.append({"keyname": f"{i + 1} {container_display_name(c)[:12]}",
+                     "value": _card_value(f"{dot} {state}")})
+    if not rows:
+        rows.append({"keyname": "容器", "value": "没有容器"})
+    buttons = []
+    if page > 0:
+        buttons.append({"text": "⬅️ 上一页", "style": 2, "key": f"MG_PREV_{page - 1}"})
+    if page < total_pages - 1:
+        buttons.append({"text": "下一页 ➡️", "style": 2, "key": f"MG_NEXT_{page + 1}"})
+    buttons.append({"text": "🧹 清理镜像", "style": 1, "key": "MG_PRUNE"})
+    buttons.append({"text": "⬅️ 主菜单", "style": 2, "key": "CARD_MENU"})
+    card = _make_card(
+        f"容器管理（第 {page + 1}/{total_pages} 页，共 {len(items)} 个）",
+        rows, buttons=buttons, task_prefix="mg",
+        sub_title="回复序号选容器，例如：3")
+    return card, page, total_pages, len(items)
+
+
+def build_container_detail_card(c, inspect=None):
+    """容器详情卡：镜像/状态/ID/端口/创建时间/重启策略 + 6 个操作按钮。
+
+    取舍：卡片按钮上限 6 个，6 个操作按钮占满，返回靠底部菜单
+    （容器 → 容器管理）或直接发“容器管理”。
+    """
+    name = container_display_name(c)
+    shortid = c["Id"][:12]
+    ports = c.get("Ports") or []
+    port_s = ", ".join(f"{p.get('PublicPort', '')}->{p.get('PrivatePort', '')}"
+                       for p in ports if p.get("PrivatePort")) or "无"
+    rows = [
+        {"keyname": "镜像", "value": _card_value(c.get("Image", "?"))},
+        {"keyname": "状态", "value": _card_value(f"{c.get('State', '?')} {c.get('Status', '')}")},
+        {"keyname": "ID", "value": shortid},
+        {"keyname": "端口", "value": _card_value(port_s)},
+    ]
+    if inspect:
+        created = (inspect.get("Created", "") or "")[:19].replace("T", " ")
+        restart = ((inspect.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name", "?")
+        rows.append({"keyname": "创建时间", "value": _card_value(created or "？")})
+        rows.append({"keyname": "重启策略", "value": _card_value(restart)})
+    buttons = []
+    for b in DETAIL_BUTTONS_TEMPLATE:
+        buttons.append({"text": b["text"], "style": b["style"],
+                        "key": b["key"].replace("{sid}", shortid)})
+    return _make_card(f"🐳 {name}", rows, buttons=buttons, task_prefix="cd")
+
+
+def build_esxi_list_card(vms, userid=""):
+    """ESXi VM 列表卡：每 VM 一行（ID → 名字 + 电源状态）+ 每 VM 一个按钮。
+
+    VM 一般不多，按钮放得下（≤5 个 VM 按钮 + 主菜单 = 6 个上限）；
+    超过 5 个改走编号列表 + 回复序号选 VM。
+    """
+    if userid:
+        _ESXI_STATE[userid] = {
+            "items": [v["vmid"] for v in vms],
+            "expires": time.monotonic() + _SELECT_TTL_SEC,
+        }
+    rows = []
+    for v in vms[:6]:
+        dot = "🟢" if v.get("state") == "on" else "⚪"
+        rows.append({"keyname": str(v["vmid"]),
+                     "value": _card_value(f"{dot} {v['name']} {v.get('state', '?')}")})
+    if not rows:
+        rows.append({"keyname": "VM", "value": "没有 VM"})
+    buttons = []
+    if len(vms) <= 5:
+        for v in vms:
+            dot = "🟢" if v.get("state") == "on" else "⚪"
+            buttons.append({"text": f"{dot} {v['name'][:8]}", "style": 1,
+                            "key": f"E_DETAIL_{v['vmid']}"})
+    buttons.append({"text": "⬅️ 主菜单", "style": 2, "key": "CARD_MENU"})
+    sub = "回复序号选 VM" if len(vms) > 5 else "点 VM 看详情、开关机"
+    return _make_card("🖥️ ESXi VM", rows, buttons=buttons[:6],
+                      task_prefix="esxi", sub_title=sub)
+
+
+def build_vm_detail_card(v):
+    """VM 详情卡：名字/ID/电源 + [开机][优雅关机][强制断电][VM 列表][主菜单]。"""
+    rows = [
+        {"keyname": "名字", "value": _card_value(v["name"])},
+        {"keyname": "ID", "value": str(v["vmid"])},
+        {"keyname": "电源", "value": _card_value(v.get("state", "?"))},
+    ]
+    buttons = []
+    for b in VM_BUTTONS_TEMPLATE:
+        buttons.append({"text": b["text"], "style": b["style"],
+                        "key": b["key"].replace("{vmid}", str(v["vmid"]))})
+    return _make_card(f"🖥️ {v['name']}", rows, buttons=buttons, task_prefix="vm")
+
+
+def build_alerts_card():
+    """告警状态卡：开关/间隔/阈值/上次检查 + [开启或关闭告警][主菜单]。"""
+    enabled = alerts_enabled()
+    rows = [
+        {"keyname": "开关", "value": "开启" if enabled else "关闭"},
+        {"keyname": "间隔", "value": f"每 {ALERT_INTERVAL_SEC // 60} 分钟"},
+        {"keyname": "磁盘阈值", "value": f"{ALERT_DISK_PCT:g}%"},
+        {"keyname": "负载阈值", "value": f"{_cpu_count()} 线程 ×{ALERT_LOAD_MULT:g}"},
+        {"keyname": "内存阈值", "value": f"{ALERT_MEM_PCT:g}%"},
+        {"keyname": "上次检查", "value": _card_value(_ALERT_STATE.get("last_check") or "还没有")},
+    ]
+    buttons = ALERT_BUTTONS_ON if enabled else ALERT_BUTTONS_OFF
+    return _make_card("🔔 主动告警", rows, buttons=buttons, task_prefix="al")
+
+
+def build_help_card():
+    """功能菜单卡：三组功能一览 + [系统状态][容器列表][主菜单]。"""
+    rows = [
+        {"keyname": "总览", "value": "系统状态 公网IP 磁盘 温度 帮助"},
+        {"keyname": "容器", "value": "列表 管理 资源 检查更新 清理"},
+        {"keyname": "更多", "value": "ESXi 网络 进程 告警 检查更新"},
+    ]
+    return _make_card("功能菜单", rows, buttons=HELP_BUTTONS, task_prefix="help",
+                      sub_title="底部菜单常驻，也可直接发指令")
 
 
 def _read_text(path):
@@ -748,6 +1159,912 @@ def container_logs(name, tail=50):
     return demux_logs(body)
 
 
+# ---------------- Docker 写操作（v2.1 新增，从 Telegram bot3 复制） ----------------
+# 注意：这些函数会改动容器，只通过两步确认卡片调用，绝不直接由文字触发。
+
+def docker_api_body(method, path, body, timeout=60, content_type="application/json"):
+    conn = UnixHTTPConnection(DOCKER_SOCK, timeout=timeout)
+    try:
+        conn.request(method, path, body=body, headers={"Content-Type": content_type})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def docker_json_body(method, path, payload, timeout=60):
+    status, body = docker_api_body(method, path, json.dumps(payload).encode("utf-8"), timeout=timeout)
+    if status >= 400:
+        raise RuntimeError(f"Docker API {method} {path} 返回 {status}：{body[:200]!r}")
+    return json.loads(body) if body else None
+
+
+# 主人主动停的容器，15 分钟内不触发“容器停了”告警。
+_INTENTIONAL_STOPS = {}
+
+
+def record_intentional_stop(cid):
+    _INTENTIONAL_STOPS[cid] = time.monotonic() + 900
+
+
+def container_action(name, action):
+    """启动/停止/重启容器。action ∈ {"start", "stop", "restart"}。"""
+    c = resolve_container(name)
+    path = f"/containers/{c['Id']}/{action}"
+    if action == "stop":
+        path += "?t=10"
+    status, body = docker_api("POST", path)
+    if status not in (204, 304):
+        raise RuntimeError(f"{action} 失败 {status}：{body[:200]!r}")
+    if action == "stop":
+        record_intentional_stop(c["Id"])
+    return c
+
+
+def inspect_container(cid):
+    return docker_json("GET", f"/containers/{cid}/json")
+
+
+def _split_image(image):
+    image = image.strip()
+    if "@" in image:
+        raise ValueError("带 digest 的镜像暂不支持更新")
+    slash = image.rfind("/")
+    colon = image.rfind(":")
+    if colon > slash:
+        return image[:colon], image[colon + 1:]
+    return image, "latest"
+
+
+def docker_pull(image, timeout=600):
+    """拉取镜像。返回 (ok, message)。流式读进度，遇到 error 即失败。"""
+    name, tag = _split_image(image)
+    path = f"/images/create?fromImage={quote(name, safe='')}&tag={quote(tag, safe='')}"
+    conn = UnixHTTPConnection(DOCKER_SOCK, timeout=timeout)
+    try:
+        conn.request("POST", path)
+        resp = conn.getresponse()
+        if resp.status >= 400:
+            return False, f"拉取失败 {resp.status}：{resp.read()[:200]!r}"
+        last_status = ""
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("error"):
+                return False, f"拉取失败：{ev['error']}"
+            if ev.get("status"):
+                last_status = ev["status"]
+        return True, last_status or "拉取完成"
+    finally:
+        conn.close()
+
+
+def prune_images():
+    """只清悬空镜像（dangling=true），不碰正在用的镜像。返回 (个数, 释放字节)。"""
+    result = docker_json("POST", "/images/prune?dangling=true", timeout=60)
+    deleted = (result or {}).get("ImagesDeleted") or []
+    reclaimed = (result or {}).get("SpaceReclaimed", 0)
+    return len(deleted), reclaimed
+
+
+def search_container_logs(name, keyword, tail=200, max_hits=30):
+    """在容器最近 tail 行日志里找关键词（不区分大小写）。返回 (命中行, 命中总数)。"""
+    text = container_logs(name, tail)
+    kw = keyword.lower()
+    hits = [ln for ln in text.splitlines() if kw in ln.lower()]
+    return hits[:max_hits], len(hits)
+
+
+def build_recreate_config(inspect_data, new_image):
+    """从 inspect 构造 create 请求体（只保留可安全重建的字段）。
+
+    关键：匿名卷不会自动跟到新容器，必须把 Mounts 里的 volume 显式绑回，
+    否则数据会丢在孤卷里。环境变量会原样带过去（重建必需），但绝不显示。
+    """
+    cfg = inspect_data.get("Config") or {}
+    host = inspect_data.get("HostConfig") or {}
+    binds = list(host.get("Binds") or [])
+    bound_dests = set()
+    for b in binds:
+        parts = b.split(":")
+        if len(parts) >= 2:
+            bound_dests.add(parts[1])
+    for m in inspect_data.get("Mounts") or []:
+        if m.get("Type") == "volume":
+            dest = m.get("Destination")
+            src = m.get("Name")
+            if dest and src and dest not in bound_dests:
+                mode = "rw" if m.get("RW") else "ro"
+                binds.append(f"{src}:{dest}:{mode}")
+                bound_dests.add(dest)
+    network_mode = host.get("NetworkMode") or "default"
+    if network_mode.startswith("container:"):
+        raise ValueError("该容器用了 container: 网络模式，无法安全重建")
+    endpoints = {}
+    if network_mode not in ("host", "none"):
+        nets = ((inspect_data.get("NetworkSettings") or {}).get("Networks") or {})
+        for net_name, ep in nets.items():
+            endpoints[net_name] = {"Aliases": (ep or {}).get("Aliases") or []}
+    host_cfg = {
+        "Binds": binds,
+        "PortBindings": host.get("PortBindings") or {},
+        "RestartPolicy": host.get("RestartPolicy") or {"Name": "no"},
+        "NetworkMode": network_mode,
+        "Privileged": bool(host.get("Privileged")),
+        "CapAdd": host.get("CapAdd") or [],
+        "CapDrop": host.get("CapDrop") or [],
+        "Devices": host.get("Devices") or [],
+        "Dns": host.get("Dns") or [],
+        "ExtraHosts": host.get("ExtraHosts") or [],
+        "LogConfig": host.get("LogConfig") or {},
+        "Memory": host.get("Memory") or 0,
+        "NanoCpus": host.get("NanoCpus") or 0,
+        "PidMode": host.get("PidMode") or "",
+        "IpcMode": host.get("IpcMode") or "",
+        "Ulimits": host.get("Ulimits") or [],
+        "Tmpfs": host.get("Tmpfs") or {},
+        "Sysctls": host.get("Sysctls") or {},
+    }
+    if host.get("StopTimeout"):
+        host_cfg["StopTimeout"] = host["StopTimeout"]
+    create = {
+        "Image": new_image,
+        "User": cfg.get("User") or "",
+        "AttachStdin": False, "AttachStdout": False, "AttachStderr": False,
+        "Tty": bool(cfg.get("Tty")),
+        "OpenStdin": bool(cfg.get("OpenStdin")),
+        "StdinOnce": bool(cfg.get("StdinOnce")),
+        "Env": list(cfg.get("Env") or []),
+        "Cmd": cfg.get("Cmd"),
+        "Entrypoint": cfg.get("Entrypoint"),
+        "WorkingDir": cfg.get("WorkingDir") or "",
+        "Labels": dict(cfg.get("Labels") or {}),
+        "ExposedPorts": cfg.get("ExposedPorts") or {},
+        "Volumes": cfg.get("Volumes") or {},
+        "HostConfig": host_cfg,
+    }
+    if cfg.get("Hostname"):
+        create["Hostname"] = cfg["Hostname"]
+    if cfg.get("Domainname"):
+        create["Domainname"] = cfg["Domainname"]
+    if cfg.get("StopSignal"):
+        create["StopSignal"] = cfg["StopSignal"]
+    if endpoints:
+        create["NetworkingConfig"] = {"EndpointsConfig": endpoints}
+    return create
+
+
+def _container_state(cid):
+    try:
+        data = inspect_container(cid)
+        state = data.get("State") or {}
+        return state.get("Status"), (state.get("Health") or {}).get("Status")
+    except Exception:
+        return None, None
+
+
+_UPDATE_LOCK = threading.Lock()
+
+
+def update_container_flow(query):
+    """拉取新镜像并重建容器。旧容器保留到新容器跑起来后才删；失败则回滚。"""
+    if not _UPDATE_LOCK.acquire(blocking=False):
+        return False, "已有容器更新在进行中，稍后再试。"
+    try:
+        return _update_container_inner(query)
+    finally:
+        _UPDATE_LOCK.release()
+
+
+def _update_container_inner(query):
+    try:
+        c = resolve_container(query)
+    except Exception as e:
+        return False, f"找不到容器：{e}"
+    name = container_display_name(c)
+    cid = c["Id"]
+    if name == SELF_CONTAINER_NAME:
+        return False, "企微桥自己不能用这种方式更新，请用菜单的“检查更新”。"
+    image_ref = (c.get("Image") or "").strip()
+    if not image_ref:
+        return False, "读不到该容器的镜像名，无法更新。"
+    try:
+        inspect_data = inspect_container(cid)
+    except Exception as e:
+        return False, f"读容器详情失败：{e}"
+    old_image_id = inspect_data.get("Image", "")
+    try:
+        ok, pull_msg = docker_pull(image_ref)
+    except Exception as e:
+        return False, f"拉取镜像失败：{e}"
+    if not ok:
+        return False, pull_msg
+    try:
+        img = docker_json("GET", "/images/" + quote(image_ref, safe="") + "/json")
+        if img.get("Id") and old_image_id and img["Id"] == old_image_id:
+            return True, f"✅ {name} 的镜像已是最新（{image_ref}），无需重建。"
+    except Exception:
+        pass
+    try:
+        create_cfg = build_recreate_config(inspect_data, image_ref)
+    except Exception as e:
+        return False, f"无法安全重建：{e}"
+    temp_name = re.sub(r"[^a-zA-Z0-9_.-]", "-", f"{name}-upd-{int(time.time()) % 100000}")
+    try:
+        created = docker_json_body("POST", f"/containers/create?name={quote(temp_name, safe='')}",
+                                   create_cfg, timeout=60)
+    except Exception as e:
+        return False, f"创建新容器失败（旧容器未动）：{e}"
+    new_id = (created or {}).get("Id")
+    if not new_id:
+        return False, "创建新容器失败（旧容器未动）：Docker 没有返回新容器 ID。"
+    try:
+        docker_api("POST", f"/containers/{cid}/stop?t=10", timeout=30)
+    except Exception as e:
+        log("update: stop old failed:", e)
+    status, body = docker_api("POST", f"/containers/{new_id}/start", timeout=30)
+    if status >= 400:
+        _rollback_update(new_id, cid)
+        return False, f"新容器启动失败（已回滚到旧容器）：{body[:200]!r}"
+    st, health = None, None
+    running = False
+    for _ in range(15):
+        time.sleep(2)
+        st, health = _container_state(new_id)
+        if st == "running" and health != "unhealthy":
+            running = True
+            break
+        if st in ("exited", "dead"):
+            break
+    if not running:
+        _rollback_update(new_id, cid)
+        return False, f"新容器没有跑起来（状态：{st}），已回滚到旧容器。请看新容器日志排查。"
+    warnings = []
+    status, _body = docker_api("DELETE", f"/containers/{cid}", timeout=30)
+    if status >= 400:
+        warnings.append(f"旧容器删除失败（{status}），请手动清理停止的旧容器。")
+    status, _body = docker_api("POST", f"/containers/{new_id}/rename?name={quote(name, safe='')}", timeout=30)
+    if status >= 400:
+        warnings.append(f"新容器已在跑，但改回原名失败（现在叫 {temp_name}）。")
+        return True, f"✅ {name} 已更新到新镜像。\n" + "\n".join(warnings)
+    msg = f"✅ {name} 已更新到新镜像并重建完成（{image_ref}）。"
+    if warnings:
+        msg += "\n" + "\n".join(warnings)
+    return True, msg
+
+
+def _rollback_update(new_id, old_id):
+    try:
+        docker_api("POST", f"/containers/{new_id}/stop?t=5", timeout=20)
+    except Exception:
+        pass
+    try:
+        docker_api("DELETE", f"/containers/{new_id}?force=true", timeout=30)
+    except Exception as e:
+        log("update rollback: remove new failed:", e)
+    try:
+        docker_api("POST", f"/containers/{old_id}/start", timeout=30)
+    except Exception as e:
+        log("update rollback: start old failed:", e)
+
+
+def update_container_async(query, userid):
+    """后台线程跑容器更新，完成后把结果发给用户（确认卡点完就回“开始更新…”）。"""
+    def _run():
+        try:
+            _ok, msg = update_container_flow(query)
+        except Exception:
+            log("update thread error:", traceback.format_exc(limit=3))
+            msg = "更新过程出错了，请看容器日志。"
+        send_reply(userid, text_reply(msg))
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def calc_cpu_percent(stats):
+    try:
+        cpu = stats.get("cpu_stats", {}) or {}
+        pre = stats.get("precpu_stats", {}) or {}
+        cpu_delta = (cpu.get("cpu_usage", {}) or {}).get("total_usage", 0) - (pre.get("cpu_usage", {}) or {}).get("total_usage", 0)
+        sys_delta = cpu.get("system_cpu_usage", 0) - pre.get("system_cpu_usage", 0)
+        percpu = (cpu.get("cpu_usage", {}) or {}).get("percpu_usage") or []
+        ncpu = len(percpu) or cpu.get("online_cpus") or 1
+        if sys_delta > 0 and cpu_delta >= 0:
+            return cpu_delta / sys_delta * ncpu * 100.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _one_container_stats(c):
+    try:
+        stats = docker_json("GET", f"/containers/{c['Id']}/stats?stream=0&one-shot=1", timeout=10)
+    except Exception:
+        return None
+    mem = stats.get("memory_stats", {}) or {}
+    usage = mem.get("usage", 0) or 0
+    cache = (mem.get("stats", {}) or {}).get("cache", 0) or 0
+    used = usage - cache if usage >= cache else usage
+    return {"name": container_display_name(c),
+            "cpu": calc_cpu_percent(stats),
+            "mem_used": used, "mem_limit": mem.get("limit", 0) or 0}
+
+
+def container_stats_all():
+    items = [c for c in list_containers() if c.get("State") == "running"]
+    if not items:
+        return []
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for r in pool.map(_one_container_stats, items):
+            if r is not None:
+                results.append(r)
+    results.sort(key=lambda r: r["cpu"], reverse=True)
+    return results
+
+
+def fmt_stats_markdown():
+    """容器资源 markdown：按 CPU 排序，每容器一行（CPU% + 内存用量）。"""
+    try:
+        results = container_stats_all()
+    except Exception as e:
+        return f"容器资源读不到：{e}"
+    if not results:
+        return "📈 容器资源\n没有运行中的容器，或资源数据读不到。"
+    lines = ["📈 容器资源（按 CPU 排序）"]
+    for r in results[:15]:
+        mem_pct = r["mem_used"] / r["mem_limit"] * 100.0 if r["mem_limit"] else 0.0
+        lines.append(f"{r['name']}  CPU {r['cpu']:.1f}%  内存 {human_bytes(r['mem_used'])}/{human_bytes(r['mem_limit'])}（{mem_pct:.0f}%）")
+    if len(results) > 15:
+        lines.append(f"…还有 {len(results) - 15} 个容器未显示")
+    return "\n".join(lines)
+
+
+# ---------------- 进程 TOP / 网络流量 / 公网 IP（v2.1 新增，从 bot3 复制） ----------------
+
+def _read_procs():
+    """读 /proc：每进程 (pid, comm, cpu_secs, mem_kb)。"""
+    out = []
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/stat", encoding="utf-8", errors="ignore") as f:
+                    parts = f.read().split()
+                with open(f"/proc/{pid}/status", encoding="utf-8", errors="ignore") as f:
+                    status_txt = f.read()
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            comm = parts[1].strip("()") if len(parts) > 1 else "?"
+            try:
+                utime = int(parts[13]); stime = int(parts[14])
+            except (IndexError, ValueError):
+                utime = stime = 0
+            mem = 0
+            for ln in status_txt.splitlines():
+                if ln.startswith("VmRSS:"):
+                    try:
+                        mem = int(ln.split()[1])
+                    except (IndexError, ValueError):
+                        mem = 0
+                    break
+            out.append({"pid": int(pid), "comm": comm, "cpu": (utime + stime) / 100.0,
+                        "mem_kb": mem})
+    except Exception as e:
+        log("read /proc failed:", e)
+    return out
+
+
+def fmt_top_markdown():
+    """进程 TOP markdown：CPU 前 10 + 内存前 5。"""
+    procs = _read_procs()
+    if not procs:
+        return "进程 TOP 读不到（/proc 不可用）。"
+    lines = ["📊 进程 TOP（CPU 前 10）"]
+    for p in sorted(procs, key=lambda x: x["cpu"], reverse=True)[:10]:
+        lines.append(f"{p['pid']} {p['comm']}  CPU {p['cpu']:.1f}s  内存 {human_bytes(p['mem_kb'] * 1024)}")
+    lines.append("")
+    lines.append("内存前 5")
+    for p in sorted(procs, key=lambda x: x["mem_kb"], reverse=True)[:5]:
+        lines.append(f"{p['pid']} {p['comm']}  {human_bytes(p['mem_kb'] * 1024)}")
+    return "\n".join(lines)
+
+
+def _read_net_dev():
+    """读 /proc/net/dev：每网卡 (收字节, 发字节)。"""
+    out = {}
+    try:
+        with open("/proc/net/dev", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()[2:]
+        for ln in lines:
+            if ":" not in ln:
+                continue
+            name, rest = ln.split(":", 1)
+            fields = rest.split()
+            if len(fields) >= 9:
+                out[name.strip()] = {"rx": int(fields[0]), "tx": int(fields[8])}
+    except Exception as e:
+        log("read /proc/net/dev failed:", e)
+    return out
+
+
+def fmt_net_markdown():
+    """网络流量 markdown：每网卡一行累计收发（lo 除外）。"""
+    devs = _read_net_dev()
+    if not devs:
+        return "网络流量读不到（/proc/net/dev 不可用）。"
+    lines = ["🌐 网络流量（累计收发）"]
+    for name, v in sorted(devs.items()):
+        if name == "lo":
+            continue
+        lines.append(f"{name}  ↓ {human_bytes(v['rx'])}  ↑ {human_bytes(v['tx'])}")
+    if len(lines) == 1:
+        lines.append("没有非 lo 网卡。")
+    return "\n".join(lines)
+
+
+def read_disk_usage():
+    """告警用的磁盘用量：返回 [{"mountpoint", "total", "used"}]（字节）。
+
+    用 shutil.disk_usage 直接读挂载点（/host 下的宿主机路径），
+    比解析 df -h 更稳。
+    """
+    out = []
+    paths = ["/host"]
+    for p in HOST_DATA_PATHS:
+        hp = "/host" + p
+        if os.path.exists(hp):
+            paths.append(hp)
+    for path in paths:
+        try:
+            usage = shutil.disk_usage(path)
+            out.append({"mountpoint": path, "total": usage.total,
+                        "used": usage.used})
+        except OSError:
+            continue
+    return out
+
+
+def read_memory():
+    """告警用的内存用量：返回 {"used_pct"}。"""
+    mem = _meminfo()
+    total = mem.get("MemTotal", 0)
+    if not total:
+        return {"used_pct": 0.0}
+    used = total - mem.get("MemAvailable", 0)
+    return {"used_pct": used / total * 100.0}
+
+
+def http_get_json(url, timeout=10):
+    """GET 一个 URL：能解析 JSON 就返回解析结果，否则返回原始文本。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "wecom-callback-bridge"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    try:
+        return json.loads(body)
+    except ValueError:
+        return body
+
+
+def fmt_public_ip_markdown():
+    """公网 IP markdown：调用 ip.sb 查询出口 IP（VM 里的接口 IP 一般是内网）。"""
+    try:
+        data = http_get_json("https://api.ip.sb/ip", timeout=10)
+        ip = data if isinstance(data, str) else str(data)
+        return f"🌐 公网 IP\n{ip.strip()}"
+    except Exception as e:
+        return f"公网 IP 查不到：{e}"
+
+
+# ---------------- ESXi（v2.1 新增，从 Telegram bot3 复制） ----------------
+
+def _esxi_connect():
+    """paramiko 连 ESXi：优先 key，失败再试密码。未填密码/key 时直接抛错。"""
+    import paramiko
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    connect_kwargs = {"hostname": ESXI_HOST, "username": ESXI_USER,
+                      "timeout": 15, "banner_timeout": 15, "auth_timeout": 15}
+    if ESXI_KEY_FILE:
+        try:
+            client.connect(look_for_keys=False, allow_agent=False,
+                           key_filename=ESXI_KEY_FILE, **connect_kwargs)
+            return client
+        except Exception as e:
+            log("ESXi key 失败，改试密码：", type(e).__name__, str(e)[:100])
+    if not ESXI_PASSWORD:
+        client.close()
+        raise RuntimeError("ESXi 未配置密码或 key，请在 .env 里填 ESXI_PASSWORD。")
+    client.connect(password=ESXI_PASSWORD, look_for_keys=False,
+                   allow_agent=False, **connect_kwargs)
+    return client
+
+
+def esxi_run(cmd, timeout=30):
+    """在 ESXi 上跑一条命令，返回 (stdout, stderr, rc)。"""
+    client = _esxi_connect()
+    try:
+        _stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        return out, err, stdout.channel.recv_exit_status()
+    finally:
+        client.close()
+
+
+def esxi_list_vms():
+    """列出 ESXi 上的 VM：[{vmid, name, state}]。"""
+    out, err, rc = esxi_run("vim-cmd vmsvc/getallvms")
+    if rc != 0:
+        raise RuntimeError(f"getallvms 失败（{rc}）：{err[:200]}")
+    vms = []
+    for ln in out.splitlines():
+        m = re.match(r"^\s*(\d+)\s+(\S+)\s+\[", ln)
+        if not m:
+            continue
+        vmid, name = m.group(1), m.group(2)
+        state = "?"
+        try:
+            out2, _err, rc2 = esxi_run(f"vim-cmd vmsvc/power.getstate {vmid}")
+            if rc2 == 0:
+                state = "on" if "Powered on" in out2 else "off"
+        except Exception:
+            pass
+        vms.append({"vmid": vmid, "name": name, "state": state})
+    return vms
+
+
+def esxi_vm_power(vmid, action):
+    """VM 电源操作：on / off（优雅关机）/ kill（强制断电）。"""
+    cmds = {
+        "on": f"vim-cmd vmsvc/power.on {vmid}",
+        "off": f"vim-cmd vmsvc/power.shutdown {vmid}",
+        "kill": f"vim-cmd vmsvc/power.off {vmid}",
+    }
+    if action not in cmds:
+        raise ValueError(f"未知 VM 电源操作：{action}")
+    out, err, rc = esxi_run(cmds[action])
+    if rc != 0:
+        raise RuntimeError(f"VM {action} 失败（{rc}）：{(err or out)[:200]}")
+    return True
+
+
+def esxi_find_nas_vm():
+    """按 .env 里的 NAS_VM_NAME / NAS_VM_ID 找到 NAS 这个 VM 的 vmid。"""
+    if NAS_VM_ID:
+        return NAS_VM_ID
+    vms = esxi_list_vms()
+    for v in vms:
+        if v["name"] == NAS_VM_NAME:
+            return v["vmid"]
+    raise RuntimeError(f"在 ESXi 上找不到名字为 {NAS_VM_NAME} 的 VM。")
+
+
+def reboot_nas_async(userid):
+    """重启 NAS（后台线程跑 vim-cmd power.reboot，完成后把结果发给用户）。"""
+    def _run():
+        try:
+            vmid = esxi_find_nas_vm()
+            esxi_run(f"vim-cmd vmsvc/power.reboot {vmid}")
+            msg = "✅ 已下发重启 NAS 的指令。NAS 正在重启，几分钟后恢复。\n此桥跑在 NAS 上，重启期间我会暂时掉线，恢复后会自动上线。"
+        except Exception as e:
+            msg = f"重启 NAS 失败：{e}"
+        send_reply(userid, text_reply(msg))
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ---------------- 主动告警（v2.1 新增，从 Telegram bot3 复制） ----------------
+
+_ALERT_STATE_FILE = "alerts.json"
+_ALERT_STATE = {"last_check": "", "last_alert": {}}
+
+
+def alerts_state_path():
+    return os.path.join(DATA_DIR, _ALERT_STATE_FILE)
+
+
+def alerts_enabled():
+    """告警开关：只看 alerts.json 里的 enabled，默认 ALERT_ENABLED_DEFAULT。"""
+    try:
+        with open(alerts_state_path(), encoding="utf-8") as f:
+            return bool(json.load(f).get("enabled", ALERT_ENABLED_DEFAULT))
+    except (FileNotFoundError, ValueError):
+        return ALERT_ENABLED_DEFAULT
+
+
+def alerts_set_enabled(enabled):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(alerts_state_path(), "w", encoding="utf-8") as f:
+        json.dump({"enabled": bool(enabled)}, f)
+
+
+def _alert_allowed(key):
+    """同一种告警 1 小时内只发一次；从没发过的第一次一定发。"""
+    last = _ALERT_STATE["last_alert"].get(key)
+    if last is not None and time.monotonic() - last < ALERT_COOLDOWN_SEC:
+        return False
+    _ALERT_STATE["last_alert"][key] = time.monotonic()
+    return True
+
+
+def run_alert_check():
+    """一次告警检查，返回告警正文列表（无事返回 []）。"""
+    alerts = []
+    try:
+        items = list_containers()
+        now = time.monotonic()
+        for c in items:
+            if c.get("State") != "running":
+                stop_deadline = _INTENTIONAL_STOPS.get(c["Id"], 0)
+                if now < stop_deadline:
+                    continue
+                key = f"container:{c['Id']}"
+                if _alert_allowed(key):
+                    alerts.append(f"⚠️ 容器 {container_display_name(c)} 已停止（状态：{c.get('State', '?')}）。")
+    except Exception as e:
+        log("告警检查（容器）失败：", e)
+    try:
+        for fs in read_disk_usage():
+            pct = fs["used"] / fs["total"] * 100.0 if fs["total"] else 0
+            if pct > ALERT_DISK_PCT and _alert_allowed(f"disk:{fs['mountpoint']}"):
+                alerts.append(f"⚠️ 磁盘 {fs['mountpoint']} 已用 {pct:.0f}%（>{ALERT_DISK_PCT:g}%）。")
+    except Exception as e:
+        log("告警检查（磁盘）失败：", e)
+    try:
+        load1, _, _ = os.getloadavg()
+        load_limit = _cpu_count() * ALERT_LOAD_MULT
+        if load1 > load_limit and _alert_allowed("load"):
+            alerts.append(f"⚠️ 系统负载 {load1:.2f} 超过阈值 {load_limit:.1f}（{_cpu_count()} 核 ×{ALERT_LOAD_MULT:g}）。")
+    except Exception as e:
+        log("告警检查（负载）失败：", e)
+    try:
+        mem = read_memory()
+        if mem["used_pct"] > ALERT_MEM_PCT and _alert_allowed("mem"):
+            alerts.append(f"⚠️ 内存占用 {mem['used_pct']:.0f}% 超过 {ALERT_MEM_PCT:g}%。")
+    except Exception as e:
+        log("告警检查（内存）失败：", e)
+    _ALERT_STATE["last_check"] = cst_now()
+    return alerts
+
+
+def alert_loop():
+    """后台循环：每 ALERT_INTERVAL_SEC 秒检查一次，告警发给全部白名单用户。"""
+    while True:
+        time.sleep(ALERT_INTERVAL_SEC)
+        try:
+            if not alerts_enabled():
+                continue
+            alerts = run_alert_check()
+            if alerts:
+                text = "🚨 NAS 告警\n" + "\n".join(alerts)
+                for uid in OWNER_USERIDS:
+                    send_reply(uid, text_reply(text))
+        except Exception:
+            log("alert loop error:", traceback.format_exc(limit=3))
+
+
+# ---------------- 容器镜像更新检查（v2.1 新增，从 bot3 复制） ----------------
+
+_IMAGE_CHECK_STATE = {"last_check": "", "last_result": ""}
+
+
+def run_image_check_all():
+    """全部容器拉新镜像、比 image Id。返回 (有更新的 [{name, image}], 消息)。
+
+    带 digest 的镜像跳过；本桥自己跳过（用菜单“检查更新”走自我更新流程）。
+    """
+    try:
+        items = list_containers()
+    except Exception as e:
+        return [], f"容器列表读不到：{e}"
+    updates = []
+    for c in items:
+        name = container_display_name(c)
+        if name == SELF_CONTAINER_NAME:
+            continue
+        image = (c.get("Image") or "").strip()
+        if not image:
+            continue
+        if "@" in image:
+            continue  # 带 digest 的镜像无法拉取最新，跳过
+        try:
+            inspect_data = inspect_container(c["Id"])
+        except Exception:
+            continue
+        old_id = inspect_data.get("Image", "")
+        try:
+            ok, _msg = docker_pull(image)
+            if not ok:
+                continue
+            img = docker_json("GET", "/images/" + quote(image, safe="") + "/json")
+            new_id = img.get("Id", "")
+            if new_id and old_id and new_id != old_id:
+                updates.append({"name": name, "image": image})
+        except Exception as e:
+            log("image check skip:", name, type(e).__name__, str(e)[:100])
+    _IMAGE_CHECK_STATE["last_check"] = cst_now()
+    _IMAGE_CHECK_STATE["last_result"] = (f"发现 {len(updates)} 个容器有新镜像"
+                                         if updates else "全部容器镜像都是最新")
+    return updates, _IMAGE_CHECK_STATE["last_result"]
+
+
+def image_check_loop():
+    """后台循环：启动后 60 秒先检查一次，之后每 IMAGE_CHECK_INTERVAL_SEC 检查一次。
+
+    只在“新发现”有更新的容器时才通知；已通知过的镜像更新只会出现在
+    “检查容器更新”结果卡里，不会重复打扰。
+    """
+    if not IMAGE_CHECK_ENABLED:
+        return
+    notified = set()
+    while True:
+        time.sleep(60 if not _IMAGE_CHECK_STATE["last_check"] else IMAGE_CHECK_INTERVAL_SEC)
+        try:
+            updates, _msg = run_image_check_all()
+            fresh = [u for u in updates if u["name"] not in notified]
+            if fresh:
+                text = ("🐳 发现容器镜像有更新\n" +
+                        "\n".join(f"· {u['name']}（{u['image']}）" for u in fresh) +
+                        "\n点“检查容器更新”看详情，每个容器可单独确认更新。")
+                for uid in OWNER_USERIDS:
+                    send_reply(uid, text_reply(text))
+                for u in fresh:
+                    notified.add(u["name"])
+        except Exception:
+            log("image check loop error:", traceback.format_exc(limit=3))
+
+
+# ---------------- 自我更新（v2.1 新增，从 bot3 复制，适配 WeCom） ----------------
+
+_SELFUPDATE_STATE = {"candidate": None, "candidate_at": 0}
+
+
+def _github_headers():
+    headers = {"Accept": "application/vnd.github.v3+json",
+               "User-Agent": "wecom-callback-bridge"}
+    if UPDATE_TOKEN:
+        headers["Authorization"] = f"Bearer {UPDATE_TOKEN}"
+    return headers
+
+
+def github_file_sha(ref="main", path="wecom_callback.py"):
+    """查 GitHub 上 wecom_callback.py 当前的 sha。"""
+    url = f"https://api.github.com/repos/{UPDATE_REPO}/contents/{path}?ref={ref}"
+    req = urllib.request.Request(url, headers=_github_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError(f"仓库或文件不存在：{UPDATE_REPO}（ref={ref}）")
+        if e.code == 401:
+            raise RuntimeError("GitHub 认证失败：UPDATE_TOKEN 无效或过期")
+        raise RuntimeError(f"GitHub API 失败：{e.code}")
+    except Exception as e:
+        raise RuntimeError(f"GitHub 请求失败：{e}")
+    return data.get("sha"), data.get("content", "").replace("\n", "")
+
+
+def _validate_candidate(src):
+    """校验候选更新：大小 10KB-500KB、UTF-8、版本比当前新、含关键函数、可编译。"""
+    if not (10 * 1024 <= len(src) <= 500 * 1024):
+        return False, f"候选文件大小异常（{len(src)} 字节）"
+    try:
+        src_str = src.decode("utf-8")
+    except UnicodeDecodeError:
+        return False, "候选文件不是 UTF-8"
+    m = re.search(r'^VERSION\s*=\s*"([0-9.]+)"', src_str, re.M)
+    if not m:
+        return False, "候选文件里没有 VERSION"
+    new_version = m.group(1)
+    if new_version <= VERSION:
+        return False, f"候选版本 {new_version} 不比当前版本 {VERSION} 新"
+    for marker in ("def main(", "def handle_callback(", "def handle("):
+        if marker not in src_str:
+            return False, f"候选文件缺关键函数 {marker}"
+    try:
+        compile(src_str, "wecom_callback.py", "exec")
+    except SyntaxError as e:
+        return False, f"候选文件语法错误：{e}"
+    return True, new_version
+
+
+def _self_update_candidate_path():
+    return os.path.join(DATA_DIR, "update_candidate.py")
+
+
+def check_self_update():
+    """检查 GitHub 上有没有新版本。返回 (有新版本, 消息)。"""
+    if not UPDATE_REPO:
+        return False, SELFUPDATE_NOT_CONFIGURED_TEXT
+    try:
+        sha, content_b64 = github_file_sha(ref=UPDATE_BRANCH)
+    except Exception as e:
+        return False, f"检查更新失败：{e}"
+    try:
+        src = base64.b64decode(content_b64)
+    except Exception:
+        return False, "GitHub 返回的内容解不开。"
+    ok, info = _validate_candidate(src)
+    if not ok:
+        if info.startswith("候选版本"):
+            return False, f"✅ 当前已是最新版本 v{VERSION}（GitHub 上 {info}）。"
+        return False, f"检查更新失败：{info}"
+    with open(_self_update_candidate_path(), "wb") as f:
+        f.write(src)
+    _SELFUPDATE_STATE["candidate"] = src
+    _SELFUPDATE_STATE["candidate_at"] = time.monotonic()
+    return True, f"⬆️ 发现新版本 v{info}（当前 v{VERSION}），已下载到本地待确认。"
+
+
+def install_staged_update():
+    """装已验证的候选更新：备份当前文件、换成候选、重启容器。"""
+    candidate_path = _self_update_candidate_path()
+    if not os.path.exists(candidate_path):
+        return False, "没有待安装的更新候选，请先点“检查更新”。"
+    if time.monotonic() - _SELFUPDATE_STATE.get("candidate_at", 0) > 1800:
+        try:
+            os.remove(candidate_path)
+        except OSError:
+            pass
+        return False, "更新候选已过期（30 分钟），请重新检查更新。"
+    src = _SELFUPDATE_STATE.get("candidate")
+    if src is None:
+        with open(candidate_path, "rb") as f:
+            src = f.read()
+    ok, info = _validate_candidate(src)
+    if not ok:
+        return False, f"候选校验失败，拒绝安装：{info}"
+    script_path = os.path.abspath(__file__)
+    backup_path = script_path + ".bak"
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(script_path, "rb") as f:
+            old = f.read()
+        with open(backup_path, "wb") as f:
+            f.write(old)
+        with open(script_path, "wb") as f:
+            f.write(src)
+        os.remove(candidate_path)
+        _SELFUPDATE_STATE["candidate"] = None
+        log(f"自我更新：已备份到 {backup_path}，正在重启容器")
+        threading.Thread(target=_restart_self, daemon=True).start()
+        return True, f"✅ 已安装 v{info}，正在重启容器（备份在 {backup_path}，30 秒后恢复）。"
+    except Exception as e:
+        log("install update error:", traceback.format_exc(limit=3))
+        return False, f"安装失败：{e}"
+
+
+def _restart_self():
+    """本容器重启：优先用 Docker API 重启自己（容器内可调 Docker socket）。"""
+    time.sleep(2)
+    try:
+        self_id = None
+        with open("/proc/self/cgroup", encoding="utf-8", errors="ignore") as f:
+            for ln in f:
+                m = re.search(r"/docker/([0-9a-f]{64})", ln)
+                if m:
+                    self_id = m.group(1)
+                    break
+        if self_id:
+            docker_api("POST", f"/containers/{self_id}/restart?t=5", timeout=30)
+            return
+    except Exception as e:
+        log("restart self via Docker API failed:", e)
+    try:
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+    except Exception as e:
+        log("restart self exec failed:", e)
+
+
 # ---------------- 消息路由（与 v1.0 同一套优先级，可单测） ----------------
 
 def strip_mention(text):
@@ -812,17 +2129,63 @@ def card_reply(card):
 def handle_text(text, userid=""):
     """路由一条文本消息，返回回复对象 {"kind": "text"|"template_card", ...}。
 
-    优先级：(a) 只读本地查询 → (b) 破坏性操作回绝 → (c) 帮助 → (d) LLM 聊天。
+    优先级：(a) 搜日志关键词输入 → (b) 容器管理序号选择 → (c) /命令和中文直达
+    （只读本地查询）→ (d) 需要确认的危险操作 → (e) 帮助 → (f) LLM 聊天。
     状态 / 磁盘 / 温度走模板卡片，容器列表走 markdown 短行，绝不发彩条文本块。
     """
     text = strip_mention(text)
     if not text:
         return text_reply(HELP_TEXT)
     lowered = text.lower().replace(" ", "").replace("　", "")
+    # (a) 正在等用户回“搜日志关键词”（卡片 [搜日志] 点完后）
+    pending = _PENDING_SEARCH.get(userid)
+    if pending:
+        shortid, expires = pending
+        if time.monotonic() <= expires:
+            del _PENDING_SEARCH[userid]
+            try:
+                hits, total = search_container_logs(shortid, text, tail=200)
+                if not hits:
+                    return text_reply(f"🔍 在 {shortid} 最近 200 行日志里没找到“{text}”。")
+                body = "\n".join(hits)
+                return text_reply(f"🔍 “{text}”在 {shortid} 里命中 {total} 行\n{body[-3000:]}")
+            except Exception as e:
+                log("搜日志失败：", type(e).__name__, str(e)[:200])
+                return text_reply(f"搜日志失败：{e}")
+        del _PENDING_SEARCH[userid]
+    # (b) 容器管理 / ESXi 列表的序号选择
+    state = _MANAGE_STATE.get(userid)
+    if state and time.monotonic() <= state.get("expires", 0) and lowered.isdigit():
+        idx = int(lowered) - 1
+        items = state.get("items") or []
+        if 0 <= idx < len(items):
+            try:
+                c = inspect_container(items[idx])
+                return card_reply(build_container_detail_card(c, inspect=c))
+            except Exception as e:
+                log("容器详情失败：", type(e).__name__, str(e)[:200])
+                return text_reply(f"容器详情读不到：{e}")
+    esxi_state = _ESXI_STATE.get(userid)
+    if esxi_state and time.monotonic() <= esxi_state.get("expires", 0) and lowered.isdigit():
+        idx = int(lowered) - 1
+        items = esxi_state.get("items") or []
+        if 0 <= idx < len(items):
+            try:
+                vms = esxi_list_vms()
+                for v in vms:
+                    if v["vmid"] == items[idx]:
+                        return card_reply(build_vm_detail_card(v))
+                return text_reply("这个 VM 现在找不到了，请重新点 ESXi VM。")
+            except Exception as e:
+                log("VM 详情失败：", type(e).__name__, str(e)[:200])
+                return text_reply(f"VM 详情读不到：{e}")
+    # (c) /命令和中文直达
     try:
-        if lowered in ("系统状态", "nas状态", "状态", "status"):
+        if lowered in ("系统状态", "nas状态", "状态", "status", "/status"):
             return card_reply(build_status_card())
-        if lowered in ("磁盘空间", "磁盘", "disk"):
+        if lowered in ("公网ip", "公网", "ip", "/ip"):
+            return text_reply(fmt_public_ip_markdown())
+        if lowered in ("磁盘空间", "磁盘", "disk", "/disk"):
             card = build_disk_card()
             if card is None:
                 return text_reply("磁盘读不到，请稍后再试，或去 Telegram 3 号机器人查。")
@@ -832,8 +2195,42 @@ def handle_text(text, userid=""):
             if card is None:
                 return text_reply(TEMP_UNAVAILABLE_TEXT)
             return card_reply(card)
-        if lowered in ("容器列表", "容器", "containers"):
+        if lowered in ("进程top", "top", "进程"):
+            return text_reply(fmt_top_markdown())
+        if lowered in ("网络流量", "网络", "流量", "net"):
+            return text_reply(fmt_net_markdown())
+        if lowered in ("容器列表", "容器", "containers", "/docker"):
             return text_reply(fmt_containers_markdown())
+        if lowered in ("容器管理", "管理容器", "管理"):
+            card, _page, _total, _n = build_manage_card(page=0, userid=userid)
+            return card_reply(card)
+        if lowered in ("容器资源", "资源", "stats"):
+            return text_reply(fmt_stats_markdown())
+        if lowered in ("检查容器更新", "容器更新"):
+            return _check_updates_reply(userid)
+        if lowered in ("清理镜像", "清理", "prune"):
+            return ask_confirm("prune", "prune", "", "🧹 清理悬空镜像",
+                               "只清悬空镜像，不碰正在用的镜像。",
+                               userid)
+        if lowered in ("esxi", "esxivm", "vm", "/esxi"):
+            return _esxi_list_reply(userid)
+        if lowered in ("告警", "alerts", "/alerts"):
+            return card_reply(build_alerts_card())
+        if lowered in ("检查更新", "自我更新", "自升", "检查更新（自升）"):
+            return _self_update_check_reply(userid)
+        if lowered in ("/check_updates", "/checkupdates"):
+            return _check_updates_reply(userid)
+        if lowered in ("重启nas", "重启", "reboot"):
+            if not (ESXI_HOST and (NAS_VM_NAME or NAS_VM_ID)):
+                return text_reply(NAS_REBOOT_NOT_CONFIGURED_TEXT)
+            return ask_confirm("nas", "reboot", "", "🔄 重启 NAS",
+                               "NAS 整个重启，桥会掉线几分钟。",
+                               userid)
+        if lowered in ("帮助", "help", "/help", "你好", "hi", "hello",
+                       "你能做什么", "功能"):
+            return text_reply(HELP_TEXT)
+        if lowered in ("菜单", "menu", "/menu"):
+            return card_reply(build_help_card())
         m = re.match(r"^(?:容器日志|日志|logs?)\s*(.+)$", text, re.IGNORECASE)
         if lowered in ("容器日志", "日志"):
             return text_reply("请告诉我容器名，例如：容器日志 tg-bot3")
@@ -844,15 +2241,200 @@ def handle_text(text, userid=""):
             logs = container_logs(name, tail=50)
             logs = logs[-3000:] if len(logs) > 3000 else logs
             return text_reply(f"📋 {name} 最近日志\n{logs}" if logs else f"📋 {name} 最近没有日志。")
+        m2 = re.match(r"^/docker\s+(.+)$", text, re.IGNORECASE)
+        if m2:
+            return _docker_command(m2.group(1).strip(), userid)
+        m3 = re.match(r"^/esxi\s+(.+)$", text, re.IGNORECASE)
+        if m3:
+            return _esxi_command(m3.group(1).strip(), userid)
+        m4 = re.match(r"^/alerts\s+(.+)$", text, re.IGNORECASE)
+        if m4:
+            return _alerts_command(m4.group(1).strip(), userid)
     except Exception as e:
         log("本地查询失败：", type(e).__name__, str(e)[:200])
         return text_reply(f"本地查询失败：{e}。请稍后再试，或去 Telegram 3 号机器人查。")
+    # (d) 需要确认的危险操作（TG 里是直接执行 / 两次确认，企微一律先出确认卡）
     if is_destructive(text):
-        log("破坏性操作请求已回绝（v2 不执行）：", userid, text[:80])
-        return text_reply(DESTRUCTIVE_TEXT)
-    if lowered in ("你好", "hi", "hello", "帮助", "help", "你能做什么", "功能", "菜单"):
-        return text_reply(HELP_TEXT)
+        return _destructive_confirm(text, userid)
     return text_reply(chat_llm(text))
+
+
+def _check_updates_reply(userid):
+    """“检查容器更新”：先回“正在检查…”，后台线程跑完再把结果卡发给用户。"""
+    def _run():
+        try:
+            updates, msg = run_image_check_all()
+        except Exception as e:
+            send_reply(userid, text_reply(f"检查容器更新失败：{e}"))
+            return
+        if not updates:
+            send_reply(userid, text_reply("🐳 全部容器镜像都是最新。"))
+            return
+        rows = []
+        buttons = []
+        for u in updates[:5]:
+            rows.append({"keyname": u["name"][:12], "value": _card_value(u["image"])})
+            buttons.append({"text": f"⬆️ 更新 {u['name'][:8]}", "style": 1,
+                            "key": f"U_ASK_{u['name']}"})
+        buttons.append({"text": "⬅️ 主菜单", "style": 2, "key": "CARD_MENU"})
+        sub = "点“更新”会先出确认卡"
+        if len(updates) > 5:
+            sub += f"，还有 {len(updates) - 5} 个有更新的容器未列出"
+        card = _make_card(f"🐳 发现 {len(updates)} 个容器有新镜像", rows,
+                          buttons=buttons[:6], task_prefix="uc",
+                          sub_title=sub)
+        send_reply(userid, card_reply(card))
+    threading.Thread(target=_run, daemon=True).start()
+    return text_reply("🐳 正在检查全部容器镜像（要拉一遍镜像，请稍等，查完我发结果给你）。")
+
+
+def _esxi_list_reply(userid):
+    """ESXi VM 列表：未配置回提示，否则出列表卡。"""
+    if not ESXI_HOST:
+        return text_reply(ESXI_NOT_CONFIGURED_TEXT)
+    try:
+        vms = esxi_list_vms()
+    except Exception as e:
+        log("ESXi 列表失败：", type(e).__name__, str(e)[:200])
+        return text_reply(f"ESXi 列表读不到：{e}")
+    if not vms:
+        return text_reply("🖥️ ESXi 上没有 VM。")
+    return card_reply(build_esxi_list_card(vms, userid=userid))
+
+
+def _self_update_check_reply(userid):
+    """“检查更新（自我更新）”：有新版本 → 确认卡；已是最新 / 未配置 → 文本。"""
+    try:
+        has_update, msg = check_self_update()
+    except Exception as e:
+        return text_reply(f"检查更新失败：{e}")
+    if not has_update:
+        return text_reply(msg)
+    return ask_confirm("selfupdate", "install", "", "⬆️ 安装自我更新",
+                       msg, userid)
+
+
+def _docker_command(args, userid):
+    """处理 /docker <子命令>：logs/start/stop/restart/prune/update。
+
+    TG 里 start/stop/restart 是直接执行；企微一律先出确认卡。
+    """
+    parts = args.split()
+    if not parts:
+        return text_reply(fmt_containers_markdown())
+    sub = parts[0].lower()
+    if sub == "logs":
+        if len(parts) < 2:
+            return text_reply("用法：/docker logs <容器名> [行数] [关键词]")
+        tail = 50
+        keyword = None
+        rest = parts[2:]
+        if rest and rest[0].isdigit():
+            tail = int(rest[0])
+            rest = rest[1:]
+        if rest:
+            keyword = " ".join(rest)
+        try:
+            if keyword:
+                hits, total = search_container_logs(parts[1], keyword, tail=200)
+                if not hits:
+                    return text_reply(f"🔍 在 {parts[1]} 最近 200 行日志里没找到“{keyword}”。")
+                return text_reply(f"🔍 “{keyword}”在 {parts[1]} 里命中 {total} 行\n" + "\n".join(hits)[-3000:])
+            logs = container_logs(parts[1], tail=tail)
+            logs = logs[-3000:] if len(logs) > 3000 else logs
+            return text_reply(f"📋 {parts[1]} 最近日志\n{logs}" if logs else f"📋 {parts[1]} 最近没有日志。")
+        except Exception as e:
+            return text_reply(f"读日志失败：{e}")
+    if sub in ("start", "stop", "restart"):
+        if len(parts) < 2:
+            return text_reply(f"用法：/docker {sub} <容器名>")
+        try:
+            c = resolve_container(parts[1])
+        except Exception as e:
+            return text_reply(f"找不到容器：{e}")
+        labels = {"start": "▶️ 启动容器", "stop": "⏹️ 停止容器", "restart": "🔄 重启容器"}
+        return ask_confirm("container", sub, c["Id"],
+                           f"{labels[sub]} {container_display_name(c)}",
+                           f"目标：{container_display_name(c)}（{c['Id'][:12]}）",
+                           userid)
+    if sub == "prune":
+        return ask_confirm("prune", "prune", "", "🧹 清理悬空镜像",
+                           "只清悬空镜像，不碰正在用的镜像。", userid)
+    if sub == "update":
+        if len(parts) < 2:
+            return text_reply("用法：/docker update <容器名>")
+        try:
+            c = resolve_container(parts[1])
+        except Exception as e:
+            return text_reply(f"找不到容器：{e}")
+        return ask_confirm("container", "update", c["Id"],
+                           f"⬆️ 更新容器 {container_display_name(c)}",
+                           "拉新镜像并重建，失败自动回滚旧容器。",
+                           userid)
+    return text_reply(f"不知道 /docker {sub}。用法：/docker [logs|start|stop|restart|prune|update] <容器名>")
+
+
+def _esxi_command(args, userid):
+    """处理 /esxi <子命令>：on/off/kill <vmid>，一律先出确认卡。"""
+    parts = args.split()
+    if not parts:
+        return _esxi_list_reply(userid)
+    sub = parts[0].lower()
+    if sub in ("on", "off", "kill"):
+        if len(parts) < 2:
+            return text_reply(f"用法：/esxi {sub} <VM ID>")
+        labels = {"on": "▶️ 开机", "off": "⏻ 优雅关机", "kill": "⚡ 强制断电"}
+        return ask_confirm("vm", sub, parts[1],
+                           f"{labels[sub]} VM {parts[1]}",
+                           "VM 电源操作，请确认。", userid)
+    return text_reply(f"不知道 /esxi {sub}。用法：/esxi [on|off|kill] <VM ID>")
+
+
+def _alerts_command(args, userid):
+    """处理 /alerts <子命令>：on/off 开关告警。"""
+    sub = args.split()[0].lower() if args.split() else ""
+    if sub == "on":
+        alerts_set_enabled(True)
+        return text_reply("🔔 告警已开启。")
+    if sub == "off":
+        alerts_set_enabled(False)
+        return text_reply("🔕 告警已关闭。")
+    return card_reply(build_alerts_card())
+
+
+def _destructive_confirm(text, userid):
+    """把一条危险文字指令转成确认卡（绝不直接执行）。
+
+    识别：重启 NAS / 容器 start|stop|restart|update / 清理镜像 / VM 电源。
+    认不出的危险词仍按 v2.0 回绝（不猜目标）。
+    """
+    lowered = text.lower().replace(" ", "").replace("　", "")
+    if ("重启nas" in lowered or lowered in ("重启", "reboot")
+            or any(k in lowered for k in ("重启服务器", "重启主机", "重启系统"))):
+        if not (ESXI_HOST and (NAS_VM_NAME or NAS_VM_ID)):
+            return text_reply(NAS_REBOOT_NOT_CONFIGURED_TEXT)
+        return ask_confirm("nas", "reboot", "", "🔄 重启 NAS",
+                           "NAS 整个重启，桥会掉线几分钟。", userid)
+    if "清理镜像" in lowered or "清理" in lowered:
+        return ask_confirm("prune", "prune", "", "🧹 清理悬空镜像",
+                           "只清悬空镜像，不碰正在用的镜像。", userid)
+    m = re.match(r"^(?:启动|停止|重启|更新)(.+)$", text)
+    if m:
+        name = re.sub(r"^容器\s*", "", m.group(1).strip())
+        try:
+            c = resolve_container(name)
+        except Exception as e:
+            return text_reply(f"找不到容器：{e}")
+        action = {"启动": "start", "停止": "stop", "重启": "restart", "更新": "update"}[text[:2]]
+        labels = {"start": "▶️ 启动容器", "stop": "⏹️ 停止容器",
+                  "restart": "🔄 重启容器", "update": "⬆️ 更新容器"}
+        detail = ("拉新镜像并重建，失败自动回滚旧容器。" if action == "update"
+                  else f"目标：{container_display_name(c)}（{c['Id'][:12]}）")
+        return ask_confirm("container", action, c["Id"],
+                           f"{labels[action]} {container_display_name(c)}",
+                           detail, userid)
+    log("破坏性操作请求已回绝（无法识别目标）：", userid, text[:80])
+    return text_reply(DESTRUCTIVE_TEXT)
 
 
 def route_menu_click(event_key, userid=""):
@@ -866,7 +2448,11 @@ def route_menu_click(event_key, userid=""):
 
 
 def route_card_click(event_key, userid=""):
-    """卡片按钮点击 → 对应的卡片 / 文本。未知 key 返回帮助。"""
+    """卡片按钮点击 → 对应的卡片 / 文本 / 确认卡。未知 key 返回帮助。
+
+    破坏性按钮（C_ASK_*/E_ASK_*/MG_PRUNE/U_ASK_*/SU_ASK/CF_OK_）只建确认，
+    绝不直接执行；执行只发生在 CF_OK_（确认令牌有效且是本人）。
+    """
     if event_key == "CARD_TEMP":
         card = build_temp_card()
         if card is None:
@@ -879,10 +2465,146 @@ def route_card_click(event_key, userid=""):
         return card_reply(card)
     if event_key == "CARD_REFRESH":
         return card_reply(build_status_card())
+    if event_key == "CARD_STATUS":
+        return card_reply(build_status_card())
+    if event_key == "CARD_CONTAINERS":
+        return text_reply(fmt_containers_markdown())
     if event_key == "CARD_MENU":
+        return card_reply(build_help_card())
+    if event_key.startswith("MG_PREV_") or event_key.startswith("MG_NEXT_"):
+        try:
+            page = int(event_key.rsplit("_", 1)[1])
+        except ValueError:
+            return text_reply(HELP_TEXT)
+        card, _p, _t, _n = build_manage_card(page=page, userid=userid)
+        return card_reply(card)
+    if event_key == "MG_PRUNE":
+        return ask_confirm("prune", "prune", "", "🧹 清理悬空镜像",
+                           "只清悬空镜像，不碰正在用的镜像。", userid)
+    if event_key.startswith("C_LOGS_"):
+        shortid = event_key[len("C_LOGS_"):]
+        try:
+            logs = container_logs(shortid, tail=50)
+            logs = logs[-3000:] if len(logs) > 3000 else logs
+            return text_reply(f"📋 {shortid} 最近日志\n{logs}" if logs else f"📋 {shortid} 最近没有日志。")
+        except Exception as e:
+            return text_reply(f"读日志失败：{e}")
+    if event_key.startswith("C_SEARCH_"):
+        shortid = event_key[len("C_SEARCH_"):]
+        _PENDING_SEARCH[userid] = (shortid, time.monotonic() + _SELECT_TTL_SEC)
+        return text_reply(f"🔍 请直接发要搜的关键词（在 {shortid} 最近 200 行日志里找）。")
+    if event_key.startswith("C_ASK_"):
+        rest = event_key[len("C_ASK_"):]
+        action, _, shortid = rest.partition("_")
+        action = action.lower()
+        if action in ("start", "stop", "restart", "update") and shortid:
+            try:
+                c = resolve_container(shortid)
+            except Exception as e:
+                return text_reply(f"找不到容器：{e}")
+            labels = {"start": "▶️ 启动容器", "stop": "⏹️ 停止容器",
+                      "restart": "🔄 重启容器", "update": "⬆️ 更新容器"}
+            detail = ("拉新镜像并重建，失败自动回滚旧容器。" if action == "update"
+                      else f"目标：{container_display_name(c)}（{c['Id'][:12]}）")
+            return ask_confirm("container", action, c["Id"],
+                               f"{labels[action]} {container_display_name(c)}",
+                               detail, userid)
+        log("未知的容器操作按钮：", event_key, "来自", userid)
         return text_reply(HELP_TEXT)
+    if event_key == "E_LIST":
+        return _esxi_list_reply(userid)
+    if event_key.startswith("E_DETAIL_"):
+        vmid = event_key[len("E_DETAIL_"):]
+        if not ESXI_HOST:
+            return text_reply(ESXI_NOT_CONFIGURED_TEXT)
+        try:
+            vms = esxi_list_vms()
+            for v in vms:
+                if v["vmid"] == vmid:
+                    return card_reply(build_vm_detail_card(v))
+            return text_reply("这个 VM 现在找不到了，请重新点 ESXi VM。")
+        except Exception as e:
+            return text_reply(f"VM 详情读不到：{e}")
+    if event_key.startswith("E_ASK_"):
+        rest = event_key[len("E_ASK_"):]
+        action, _, vmid = rest.partition("_")
+        action = action.lower()
+        if action in ("on", "off", "kill") and vmid:
+            labels = {"on": "▶️ 开机", "off": "⏻ 优雅关机", "kill": "⚡ 强制断电"}
+            return ask_confirm("vm", action, vmid,
+                               f"{labels[action]} VM {vmid}",
+                               "VM 电源操作，请确认。", userid)
+        log("未知的 VM 电源按钮：", event_key, "来自", userid)
+        return text_reply(HELP_TEXT)
+    if event_key == "ALERT_ON":
+        alerts_set_enabled(True)
+        return text_reply("🔔 告警已开启。")
+    if event_key == "ALERT_OFF":
+        alerts_set_enabled(False)
+        return text_reply("🔕 告警已关闭。")
+    if event_key.startswith("U_ASK_"):
+        name = event_key[len("U_ASK_"):]
+        try:
+            c = resolve_container(name)
+        except Exception as e:
+            return text_reply(f"找不到容器：{e}")
+        return ask_confirm("container", "update", c["Id"],
+                           f"⬆️ 更新容器 {container_display_name(c)}",
+                           "拉新镜像并重建，失败自动回滚旧容器。", userid)
+    if event_key == "SU_ASK":
+        return _self_update_check_reply(userid)
+    if event_key.startswith("CF_OK_"):
+        token = event_key[len("CF_OK_"):]
+        return execute_confirm(token, userid)
+    if event_key.startswith("CF_NO_"):
+        token = event_key[len("CF_NO_"):]
+        with _PENDING_CONFIRM_LOCK:
+            entry = _PENDING_CONFIRM.pop(token, None)
+        if entry and entry.get("userid") == userid:
+            return text_reply("已取消，没有执行任何操作。")
+        return text_reply("这个确认已过期或不存在，没有执行任何操作。")
     log("未知的卡片按钮 key：", event_key, "来自", userid)
     return text_reply(HELP_TEXT)
+
+
+def execute_confirm(token, userid):
+    """执行一次已确认的操作：令牌无效/过期/不是本人 → 拒绝（不执行）。
+
+    容器更新和重启 NAS 是慢活：先回“开始…”，后台线程跑完再把结果发给用户。
+    """
+    entry = take_confirm(token, userid)
+    if entry is None:
+        return text_reply("这个确认已过期（5 分钟）或不是你的操作，没有执行任何操作。请重新操作一次。")
+    kind = entry.get("kind")
+    action = entry.get("action")
+    target = entry.get("target")
+    label = entry.get("label", "操作")
+    log("已确认，执行：", kind, action, target, "来自", userid)
+    try:
+        if kind == "container":
+            if action == "update":
+                update_container_async(target, userid)
+                return text_reply(f"⬆️ 开始更新容器 {label}，拉镜像要一会儿，完成后我发结果给你。")
+            c = container_action(target, action)
+            verb = {"start": "已启动", "stop": "已停止", "restart": "已重启"}[action]
+            return text_reply(f"✅ {verb}容器 {container_display_name(c)}。")
+        if kind == "prune":
+            count, reclaimed = prune_images()
+            return text_reply(f"✅ 清理完成：清了 {count} 个悬空镜像，释放 {human_bytes(reclaimed)}。")
+        if kind == "vm":
+            esxi_vm_power(target, action)
+            verb = {"on": "已开机", "off": "已下发优雅关机", "kill": "已强制断电"}[action]
+            return text_reply(f"✅ VM {target} {verb}。")
+        if kind == "nas":
+            reboot_nas_async(userid)
+            return text_reply("✅ 已确认，正在下发重启 NAS 的指令…")
+        if kind == "selfupdate":
+            ok, msg = install_staged_update()
+            return text_reply(msg)
+    except Exception as e:
+        log("确认操作执行失败：", kind, action, target, type(e).__name__, str(e)[:200])
+        return text_reply(f"执行失败：{e}。没有改动的部分请重新操作。")
+    return text_reply("未知操作，没有执行任何操作。")
 
 
 # ---------------- 自建应用主动发消息（gettoken + message/send） ----------------
@@ -1024,11 +2746,18 @@ class WeComAppClient:
         return self.send_text(touser, reply.get("content", ""))
 
     def create_menu(self):
-        """创建自定义菜单（menu/create）。返回服务端原始 JSON。"""
+        """创建自定义菜单（menu/create）。先按官方限制校验 payload，不合规直接报错。
+
+        返回服务端原始 JSON。
+        """
+        payload = build_menu_payload()
+        err = validate_menu_payload(payload)
+        if err:
+            raise RuntimeError(f"菜单校验不通过：{err}")
         token = self.get_access_token()
         url = f"{WECOM_API_BASE}/cgi-bin/menu/create"
         resp = requests.post(url, params={"access_token": token, "agentid": self.agentid},
-                             json=build_menu_payload(), timeout=15)
+                             json=payload, timeout=15)
         resp.raise_for_status()
         return resp.json()
 
@@ -1257,6 +2986,18 @@ def main():
         log("首次收到消息时日志会打印对方 userid，把它填进 .env 的 OWNER_USERIDS 后重启。")
     if not LLM_API_KEY:
         log("提示：LLM_API_KEY 未配置，聊天功能不可用，本地查询不受影响。")
+    if ESXI_HOST:
+        log("ESXi 已配置（", ESXI_HOST, "），ESXi VM、重启 NAS 可用。")
+    else:
+        log("提示：ESXI_HOST 未配置，ESXi VM、重启 NAS 会回一句“未配置”。")
+    if UPDATE_REPO:
+        log("自我更新已配置（", UPDATE_REPO, "@", UPDATE_BRANCH, "）。")
+    else:
+        log("提示：UPDATE_REPO 未配置，菜单“检查更新”会回一句“未配置”。")
+    threading.Thread(target=alert_loop, daemon=True).start()
+    log(f"主动告警后台循环已启动（每 {ALERT_INTERVAL_SEC} 秒检查一次）")
+    threading.Thread(target=image_check_loop, daemon=True).start()
+    log(f"容器镜像更新检查后台循环已启动（每 {IMAGE_CHECK_INTERVAL_SEC} 秒检查一次）")
     app.run(host="0.0.0.0", port=CALLBACK_PORT, threaded=True, use_reloader=False)
 
 
