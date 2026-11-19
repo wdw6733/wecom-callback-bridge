@@ -23,3 +23,7 @@ services:
       - ./data:/data
       # 机器人代码文件挂载（可写，方便直接改代码重启）
       - ./wecom_callback.py:/app/wecom_callback.py
+      # ESXi SSH 私钥（可选）：想用 key 连 ESXi 而不是密码时，
+      # 把私钥放进 ./data/id_ed25519，取消下面这行的注释，
+      # 并在 .env 里填 ESXI_KEY_FILE=/data/id_ed25519。
+      # - ./data/id_ed25519:/data/id_ed25519:ro
