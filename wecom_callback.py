@@ -98,7 +98,7 @@ try:
 except ImportError:  # pragma: no cover - 部署时 requirements.txt 会装好
     AES = None
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 # ---------------- 配置（只从环境变量读） ----------------
 
@@ -2884,6 +2884,16 @@ def get_cryptor():
 
 def create_app():
     app = Flask(__name__)
+
+    @app.before_request
+    def _log_every_request():
+        # 请求级日志：任何 POST 到回调地址都会先记一行（解密之前）。
+        # 用途：点了菜单/卡片却没反应时，看这行在不在——在，说明请求到了桥上，
+        # 问题在解密/解析/路由；不在，说明企微服务器根本没把点击发过来。
+        # 只记方法/路径/查询参数，不记请求体（密文，记了也没用）。
+        log("收到 HTTP 请求：", request.method, request.path,
+            "from=", request.remote_addr,
+            "args=", {k: request.args.get(k, "")[:24] for k in request.args})
 
     @app.route("/health", methods=["GET"])
     def health():
